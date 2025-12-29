@@ -1,3 +1,20 @@
+"""
+AI-GUARD NOTICE
+
+This file is part of a controlled multi-step pipeline.
+
+Rules for AI (Codex):
+- DO NOT modify any files outside this file.
+- DO NOT change function signatures once defined.
+- DO NOT import or modify internal logic of theme_scan_core.py.
+- This script is APPEND-ONLY: new features require new functions.
+
+If a required change affects other modules:
+→ STOP and explain the dependency instead of editing.
+
+Violation of these rules = critical failure.
+"""
+
 # pipeline/step1_collect.py
 from __future__ import annotations
 

@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/step3_env.schema.json",
+  "title": "Step3 Env Output Schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at_utc", "rows"],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^3\\.env\\.v\\d+$" },
+    "generated_at_utc": { "type": "string", "format": "date-time" },
+    "source": { "type": "string" },
+    "notes": { "type": "string" },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/EnvRow" }
+    }
+  },
+  "$defs": {
+    "TimeframeHTF": {
+      "type": "string",
+      "enum": ["1D", "4H", "1H", "30m", "15m"]
+    },
+    "EnvBias": {
+      "type": "string",
+      "enum": ["bull", "bear", "neutral"]
+    },
+    "EnvMethod": {
+      "type": "string",
+      "enum": ["ema_slope", "market_structure", "custom"]
+    },
+    "EnvRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asof_utc",
+        "symbol",
+        "theme",
+        "htf_timeframe",
+        "env_bias",
+        "env_score",
+        "env_confidence",
+        "env_method"
+      ],
+      "properties": {
+        "asof_utc": { "type": "string", "format": "date-time" },
+        "symbol": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 15,
+          "pattern": "^[A-Z0-9][A-Z0-9.\\-]{0,14}$"
+        },
+        "theme": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10,
+          "pattern": "^[A-Z0-9.\\-]{1,10}$"
+        },
+        "htf_timeframe": { "$ref": "#/$defs/TimeframeHTF" },
+        "env_bias": { "$ref": "#/$defs/EnvBias" },
+        "env_score": {
+          "type": "number",
+          "minimum": -100,
+          "maximum": 100
+        },
+        "env_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "env_method": { "$ref": "#/$defs/EnvMethod" },
+
+        "inputs": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "ema_fast": { "type": "integer", "minimum": 1 },
+            "ema_slow": { "type": "integer", "minimum": 2 },
+            "lookback_bars": { "type": "integer", "minimum": 1 }
+          }
+        },
+
+        "debug": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

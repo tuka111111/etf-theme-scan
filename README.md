@@ -1,3 +1,23 @@
+## ⚠️ IMPORTANT: Codex / AI Code Generation Guard
+
+This repository uses AI-assisted code generation (Codex).
+To prevent destructive or unintended changes, **the following rules are mandatory**:
+
+- ❌ Do NOT modify existing files unless explicitly instructed.
+- ❌ Do NOT refactor, rename, or reformat existing logic.
+- ❌ Do NOT optimize or “clean up” code unless asked.
+- ✅ Add new functionality ONLY by creating new files or modules.
+- ✅ Assume backward compatibility is critical.
+- ✅ When unsure, STOP and ask for clarification.
+
+Breaking these rules is considered a critical error.
+
+
+出力CSVは contracts/step1_universe.schema.json に必ず準拠
+schema にない列は追加しない
+型・列名を変えない
+
+
 # etf-theme-scan
 
 ETFの **保有銘柄（Holdings）CSV / XLSX** を入力として、  

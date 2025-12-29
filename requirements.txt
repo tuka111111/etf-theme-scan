@@ -14,3 +14,6 @@ yfinance>=0.2.33
 # cli / utils
 python-dateutil>=2.8
 tqdm>=4.66
+
+
+jsonschema>=4.22.0

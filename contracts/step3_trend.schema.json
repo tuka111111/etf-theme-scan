@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/step3_trend.schema.json",
+  "title": "Step3 Trend Output Schema (HTF-only)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at_utc", "htf_timeframe", "theme", "rows"],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "generated_at_utc": { "type": "string", "format": "date-time" },
+    "htf_timeframe": { "type": "string" },
+    "theme": { "type": "string" },
+    "source": { "type": "string" },
+    "notes": { "type": "string" },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/TrendRow" }
+    }
+  },
+  "$defs": {
+    "Timeframe": {
+      "type": "string",
+      "enum": ["1D", "4H", "1H", "30m", "15m", "5m", "1m"]
+    },
+    "TrendState": {
+      "type": "string",
+      "enum": ["up", "down", "range"]
+    },
+    "TrendMethod": {
+      "type": "string",
+      "enum": ["ema_stack", "hhll", "donchian", "custom", "htf_env_proxy"]
+    },
+    "TrendRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asof_utc",
+        "theme",
+        "symbol",
+        "htf_timeframe",
+        "trend_state",
+        "trend_strength",
+        "trend_method"
+      ],
+      "properties": {
+        "asof_utc": { "type": "string", "format": "date-time" },
+        "symbol": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 15,
+          "pattern": "^[A-Z0-9][A-Z0-9.\\-]{0,14}$"
+        },
+        "theme": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 10,
+          "pattern": "^[A-Z0-9.\\-]{1,10}$"
+        },
+        "htf_timeframe": { "$ref": "#/$defs/Timeframe" },
+        "trend_state": { "$ref": "#/$defs/TrendState" },
+        "trend_strength": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "trend_method": { "$ref": "#/$defs/TrendMethod" },
+
+        "features": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "ema_fast": { "type": "number" },
+            "ema_mid": { "type": "number" },
+            "ema_slow": { "type": "number" },
+            "atr": { "type": "number", "minimum": 0 },
+            "range_pct": { "type": "number" }
+          }
+        },
+
+        "debug": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "debug_json": { "type": "string" }
+      }
+    }
+  }
+}
