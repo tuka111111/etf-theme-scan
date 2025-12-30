@@ -97,6 +97,7 @@
           "type": "object",
           "additionalProperties": true
         },
+        "warnings": { "type": "array", "items": { "type": "string" } },
         "debug_json": { "type": "string" }
       }
     }

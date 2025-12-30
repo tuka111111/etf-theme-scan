@@ -17,3 +17,4 @@ tqdm>=4.66
 
 
 jsonschema>=4.22.0
+streamlit>=1.30

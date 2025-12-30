@@ -73,7 +73,7 @@ def _build_dashboard_rows(theme: str, score_rows: List[Dict]) -> List[Dict]:
     # Rank by score_total desc
     df = pd.DataFrame(score_rows)
     df["score_total"] = pd.to_numeric(df["score_total"], errors="coerce").fillna(0.0)
-    df_sorted = df.sort_values(["score_total"], ascending=[False]).reset_index(drop=True)
+    df_sorted = df.sort_values(["score_total", "symbol"], ascending=[False, True]).reset_index(drop=True)
     df_sorted["rank"] = df_sorted.index + 1
 
     rows: List[Dict] = []
@@ -172,6 +172,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     csv_path = dash_dir / "dashboard.csv"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     pd.DataFrame(all_rows).to_csv(csv_path, index=False)
+
+    # Symbol summary
+    sym_df = pd.DataFrame(all_rows)
+    sym_df = sym_df.rename(columns={"timeframe": "htf_timeframe"}) if "timeframe" in sym_df.columns else sym_df
+    sym_summary_cols = [
+        "theme",
+        "symbol",
+        "rank",
+        "score_total",
+        "env_bias",
+        "env_confidence",
+        "flags",
+        "asof_utc",
+    ]
+    sym_df[sym_summary_cols].to_csv(dash_dir / "symbol_summary.csv", index=False)
+
+    # Theme summary
+    theme_rows = []
+    for theme, g in sym_df.groupby("theme"):
+        theme_rows.append(
+            {
+                "theme": theme,
+                "timeframe": "",
+                "asof_utc": g["asof_utc"].iloc[0] if not g.empty else "",
+                "top_score": g["score_total"].max(),
+                "symbols_ok": g.shape[0],
+                "symbols_missing": int((g["flags"] == "missing_env").sum()) if "flags" in g else 0,
+            }
+        )
+    pd.DataFrame(theme_rows).to_csv(dash_dir / "theme_summary.csv", index=False)
 
     if not args.no_md:
         _write_markdown(dash_dir / "report.md", all_rows)

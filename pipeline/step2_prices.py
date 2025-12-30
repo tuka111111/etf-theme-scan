@@ -13,15 +13,16 @@ from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
-from .common import ensure_dir, now_utc_iso, parse_csv_list
+from .common import ensure_dir, now_utc_iso, parse_csv_list, validate_tf_combo
 from .io_step1 import group_symbols_by_theme, load_universe
 from .validate import must_validate
 
 LOG = logging.getLogger(__name__)
+_LOGGED_COLUMNS = False
 
 
 def _yf_interval(tf: str) -> str:
-    m = {"1D": "1d", "4H": "60m", "1H": "60m", "30m": "30m", "15m": "15m", "5m": "5m", "1m": "1m"}
+    m = {"1D": "1d", "1H": "60m", "15m": "15m"}
     return m.get(tf.upper(), "1d")
 
 
@@ -78,25 +79,29 @@ def _build_rows_for_symbol(theme: str, symbol: str, tf: str, lookback_days: int)
         )
         return rows
 
-    for _, r in df.iterrows():
-        # Prefer explicit date/datetime columns from reset_index(); fall back to the first column.
-        date_val = None
-        if "Date" in df.columns:
-            date_val = r.get("Date")
-        elif "Datetime" in df.columns:
-            date_val = r.get("Datetime")
-        elif "date" in df.columns:
-            date_val = r.get("date")
-        else:
-            # last resort: assume first column is the timestamp column
-            first_col = df.columns[0]
-            date_val = r.get(first_col)
+    global _LOGGED_COLUMNS
+    if not _LOGGED_COLUMNS:
+        LOG.info("Downloaded columns for %s tf=%s: %s", symbol, tf, list(df.columns))
+        _LOGGED_COLUMNS = True
 
-        try:
-            date_iso = pd.to_datetime(date_val).date().isoformat()
-        except Exception:
-            # If we cannot parse, mark as missing-date rather than stamping 'today' for every row.
-            date_iso = ""
+    date_col = None
+    for cand in ["Datetime", "Date", "date"]:
+        if cand in df.columns:
+            date_col = cand
+            break
+    if date_col is None:
+        raise ValueError(f"No Date/Datetime column returned for symbol={symbol} tf={tf}")
+
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    if tf == "1D":
+        df = df.sort_values(date_col).drop_duplicates(subset=[date_col], keep="last")
+
+    for _, r in df.iterrows():
+        date_val = r[date_col]
+        if pd.isna(date_val):
+            raise ValueError(f"NaN date for symbol={symbol} tf={tf}")
+        date_iso = pd.to_datetime(date_val).date().isoformat()
         rows.append(
             {
                 "date": date_iso,
@@ -135,7 +140,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except Exception:
         lookback_days = 260
 
-    tf = args.tf.upper()
+    tf = validate_tf_combo("step2", tf=args.tf)
     out_dir = ensure_dir(args.out)
     prices_dir = ensure_dir(out_dir / "step2_prices")
 

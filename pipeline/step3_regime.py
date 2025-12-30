@@ -10,6 +10,8 @@ import pandas as pd
 
 from .common import ensure_dir, parse_csv_list
 from .io_step1 import group_symbols_by_theme, load_universe
+from .logic_regime import classify_regime
+from .logic_sanity import check_regime_record
 from .validate import must_validate
 
 LOG = logging.getLogger(__name__)
@@ -47,57 +49,19 @@ def _load_trend(theme: str, out_dir: Path, htf: str) -> Dict[str, Dict]:
     return m
 
 
-def _regime_from(env_row: Optional[Dict], trend_row: Optional[Dict]) -> Tuple[str, str, float, float, str, Dict]:
-    env_bias = str(env_row.get("env_bias", "neutral")).lower() if env_row else "neutral"
-    env_score = float(env_row.get("env_score", 0.0)) if env_row else 0.0
-    env_conf = float(env_row.get("env_confidence", 0.0)) if env_row else 0.0
-
-    trend_state = str(trend_row.get("trend_state", "range")).lower() if trend_row else "range"
-    trend_strength = float(trend_row.get("trend_strength", 0.0)) if trend_row else 0.0
-
-    match_long = env_bias == "bull" and trend_state == "up"
-    match_short = env_bias == "bear" and trend_state == "down"
-
-    if match_long:
-        regime_state = "risk_on_long"
-        allowed = "long"
-    elif match_short:
-        regime_state = "risk_on_short"
-        allowed = "short"
-    else:
-        regime_state = "no_trade"
-        allowed = "none"
-
-    if regime_state.startswith("risk_on") and env_conf >= 0.6 and trend_strength >= 0.6:
-        mult = 1.0
-        reason = "Env/Trend aligned and strong"
-    elif regime_state.startswith("risk_on"):
-        mult = 0.5
-        reason = "Env/Trend aligned but weak confidence/strength"
-    else:
-        mult = 0.0
-        reason = "Env/Trend not aligned"
-
-    score = mult * 100.0
-
-    components = {
-        "env_bias": env_bias,
-        "env_score": env_score,
-        "env_confidence": env_conf,
-        "trend_state": trend_state,
-        "trend_strength": trend_strength,
-        "vol_state": "unknown",
-        "risk_flags": [],
-    }
-    return regime_state, allowed, mult, score, reason, components
-
-
 def _rows_for_theme(theme: str, symbols: List[str], env_map: Dict[str, Dict], trend_map: Dict[str, Dict], htf: str) -> List[Dict]:
     rows: List[Dict] = []
     for sym in symbols:
         env_row = env_map.get(sym)
         trend_row = trend_map.get(sym)
-        regime_state, allowed, mult, score, reason, components = _regime_from(env_row, trend_row)
+        env_bias = str(env_row.get("env_bias", "neutral")) if env_row else "neutral"
+        env_conf = float(env_row.get("env_confidence", 0.0)) if env_row else 0.0
+        trend_state = str(trend_row.get("trend_state", "range")) if trend_row else "range"
+        trend_strength = float(trend_row.get("trend_strength", 0.0)) if trend_row else 0.0
+
+        regime_state, allowed, mult, score, reason, components = classify_regime(
+            env_bias, env_conf, trend_state, trend_strength
+        )
         asof = (
             env_row.get("asof_utc")
             if env_row and env_row.get("asof_utc")
@@ -123,6 +87,7 @@ def _rows_for_theme(theme: str, symbols: List[str], env_map: Dict[str, Dict], tr
                 "debug_json": json.dumps({"env_row": env_row, "trend_row": trend_row}, ensure_ascii=False),
             }
         )
+        rows[-1]["warnings"] = check_regime_record(rows[-1])
     return rows
 
 
