@@ -46,10 +46,25 @@ def main() -> None:
     st.metric("Symbols shown", len(filt))
 
     st.subheader("Table")
-    st.dataframe(
-        filt.sort_values(["theme", "rank"]).reset_index(drop=True),
-        use_container_width=True,
-    )
+    order = filt.sort_values(["theme", "rank"]).reset_index(drop=True)
+    # color rows by theme using a simple pastel palette
+    palette = [
+        "#eef2ff",
+        "#e7f5ff",
+        "#f1f8e9",
+        "#fff4e6",
+        "#fce4ec",
+        "#e8f5e9",
+    ]
+    theme_list = order["theme"].unique().tolist()
+    color_map = {t: palette[i % len(palette)] for i, t in enumerate(theme_list)}
+
+    def _row_style(row: pd.Series) -> List[str]:
+        c = color_map.get(row.get("theme"), "#ffffff")
+        return [f"background-color: {c}"] * len(row)
+
+    styled = order.style.apply(_row_style, axis=1)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
     st.subheader("Top Symbols")
     top_n = st.slider("Top N", 5, 50, 10, 5)

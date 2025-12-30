@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
-from .common import ensure_dir, parse_csv_list
+from .common import ensure_dir, parse_csv_list, validate_tf_combo
 from .io_step1 import load_universe, group_symbols_by_theme
 from .validate import must_validate
 
@@ -48,6 +48,72 @@ def _read_step2_env(out_dir: Path) -> Dict[str, Dict]:
         return m
 
     return {}
+
+
+def _read_step2_prices(theme: str, out_dir: Path, tf: str) -> Dict[str, pd.Series]:
+    path = out_dir / "step2_prices" / f"prices_{theme}_{tf}.csv"
+    if not path.exists():
+        LOG.warning("Missing Step2 prices for theme=%s tf=%s: %s", theme, tf, path)
+        return {}
+    df = pd.read_csv(path, low_memory=False)
+    if df.empty:
+        return {}
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"]
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.dropna(subset=["date"])
+    df = df.sort_values(["symbol", "date"])
+    df["close"] = pd.to_numeric(df.get("close"), errors="coerce")
+    df = df.dropna(subset=["close"])
+    out: Dict[str, pd.Series] = {}
+    for sym, g in df.groupby("symbol"):
+        s = pd.Series(g["close"].astype(float).values, index=g["date"])
+        s = s[~s.index.duplicated(keep="last")]
+        if not s.empty:
+            out[sym] = s
+    return out
+
+
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
+
+
+def _symbol_confidence(bias: str, close: Optional[pd.Series]) -> Tuple[float, Dict[str, object]]:
+    if close is None or close.dropna().shape[0] < 30:
+        return 0.3, {"reason": "missing_or_short"}
+
+    c = close.dropna()
+    e20 = _ema(c, 20)
+    e50 = _ema(c, 50)
+
+    last = float(c.iloc[-1])
+    last_e20 = float(e20.iloc[-1])
+    last_e50 = float(e50.iloc[-1])
+
+    if bias == "bull":
+        align = 1.0 if (last > last_e50 and last_e20 > last_e50) else 0.3
+    elif bias == "bear":
+        align = 1.0 if (last < last_e50 and last_e20 < last_e50) else 0.3
+    else:
+        align = 0.5
+
+    def _slope(x: pd.Series, n: int = 10) -> float:
+        if len(x) <= n:
+            return 0.0
+        return float((x.iloc[-1] / x.iloc[-1 - n]) - 1.0)
+
+    slope20 = _slope(e20, 10)
+    strength = max(0.0, min(1.0, 0.5 + slope20))
+    quality = max(0.0, min(1.0, len(c) / 200.0))
+
+    conf = 0.4 * align + 0.4 * strength + 0.2 * quality
+    return max(0.0, min(1.0, conf)), {
+        "align": align,
+        "strength": strength,
+        "quality": quality,
+        "bars": len(c),
+    }
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -137,6 +203,7 @@ def build_env_rows(
     symbols: List[str],
     step2_env_map: Dict[str, Dict],
     htf_timeframe: str,
+    prices: Dict[str, pd.Series],
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
 
@@ -146,9 +213,10 @@ def build_env_rows(
     asof = _normalize_asof(env_src.get("asof"))
     bias = _derive_bias(details)
     score = _derive_score(details, bias)
-    conf = _derive_confidence(env_src, bias)
+    conf_theme = _derive_confidence(env_src, bias)
 
     for sym in symbols:
+        sym_conf, conf_debug = _symbol_confidence(bias, prices.get(sym))
         rows.append(
             {
                 "asof_utc": asof,
@@ -157,7 +225,8 @@ def build_env_rows(
                 "htf_timeframe": htf_timeframe,
                 "env_bias": bias,
                 "env_score": float(score),
-                "env_confidence": float(conf),
+                "env_confidence": float(sym_conf),
+                "env_confidence_theme": float(conf_theme),
                 "env_method": "ema_slope",
                 "inputs": {
                     "ema_fast": 20,
@@ -166,6 +235,7 @@ def build_env_rows(
                 },
                 "debug": {
                     "source_theme_env": env_src,
+                    "confidence": conf_debug,
                 },
             }
         )
@@ -199,9 +269,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     out_dir = ensure_dir(args.out)
     env_dir = ensure_dir(out_dir / "step3_env")
-    htf_timeframe = _normalize_timeframe(args.htf)
-    if htf_timeframe not in ALLOWED_HTF:
-        raise SystemExit(f"Unsupported --htf={args.htf}. Allowed: {sorted(ALLOWED_HTF)}")
+    htf_timeframe = validate_tf_combo("step3", htf=args.htf)
 
     _, rows = load_universe(out_dir, themes=themes)
     sym_by_theme = group_symbols_by_theme(rows)
@@ -209,6 +277,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     step2_env_map = _read_step2_env(out_dir)
     if not step2_env_map:
         LOG.warning("Step2 env outputs not found; using neutral defaults for env bias/score.")
+    prices_by_theme: Dict[str, Dict[str, pd.Series]] = {}
+    for theme in themes:
+        try:
+            prices_by_theme[theme] = _read_step2_prices(theme, out_dir, htf_timeframe)
+        except Exception as e:
+            LOG.warning("No prices for theme=%s tf=%s: %s", theme, htf_timeframe, e)
+            prices_by_theme[theme] = {}
 
     schema_path = Path(args.contracts) / "step3_env.schema.json"
 
@@ -226,7 +301,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             LOG.warning("No symbols found for theme=%s (after validation); skipping output.", theme)
             continue
 
-        records = build_env_rows(theme, symbols, step2_env_map, htf_timeframe)
+        records = build_env_rows(theme, symbols, step2_env_map, htf_timeframe, prices_by_theme.get(theme, {}))
 
         payload = {
             "schema_version": "3.env.v1",

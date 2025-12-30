@@ -68,6 +68,11 @@
           "minimum": 0,
           "maximum": 1
         },
+        "env_confidence_theme": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
         "env_method": { "$ref": "#/$defs/EnvMethod" },
 
         "inputs": {
