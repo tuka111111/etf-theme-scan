@@ -40,13 +40,15 @@ DASHBOARD_SCHEMA = {
         "DashboardRow": {
             "type": "object",
             "additionalProperties": True,
-            "required": ["asof_utc", "theme", "symbol", "rank", "score_total", "env_bias", "env_confidence"],
+            "required": ["asof_utc", "theme", "symbol", "rank", "env_score", "signal_score", "env_bias", "env_confidence"],
             "properties": {
                 "asof_utc": {"type": "string"},
                 "theme": {"type": "string"},
                 "symbol": {"type": "string"},
-                "rank": {"type": "integer", "minimum": 1},
+                "rank": {"type": "integer", "minimum": 0},
                 "score_total": {"type": "number"},
+                "env_score": {"type": "number"},
+                "signal_score": {"type": "number"},
                 "env_bias": {"type": "string"},
                 "env_confidence": {"type": "number"},
                 "notes": {"type": "string"},
@@ -69,26 +71,72 @@ def _load_scores(theme: str, out_dir: Path) -> List[Dict]:
     return rows
 
 
-def _build_dashboard_rows(theme: str, score_rows: List[Dict]) -> List[Dict]:
-    # Rank by score_total desc
+def _load_etf_env(theme: str, out_dir: Path) -> Dict:
+    path = out_dir / "step3_etf_env" / f"etf_env_{theme}_1D.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("rows", [])
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def _build_dashboard_rows(theme: str, score_rows: List[Dict], etf_env: Dict) -> List[Dict]:
     df = pd.DataFrame(score_rows)
-    df["score_total"] = pd.to_numeric(df["score_total"], errors="coerce").fillna(0.0)
-    df_sorted = df.sort_values(["score_total", "symbol"], ascending=[False, True]).reset_index(drop=True)
+    df["signal_score"] = pd.to_numeric(df.get("signal_score", df.get("score_total")), errors="coerce").fillna(0.0)
+    df["env_score"] = pd.to_numeric(df.get("env_score"), errors="coerce").fillna(0.0)
+    df_sorted = df.sort_values(["signal_score", "symbol"], ascending=[False, True]).reset_index(drop=True)
     df_sorted["rank"] = df_sorted.index + 1
 
     rows: List[Dict] = []
+
+    # ETF layer (background info, not mixed with symbols)
+    if etf_env:
+        env_score_theme = round(float(etf_env.get("etf_env_confidence", 0.0)) * 100.0, 1)
+        rows.append(
+            {
+                "asof_utc": str(etf_env.get("asof_date", "")),
+                "theme": theme,
+                "symbol": "__ETF__",
+                "rank": 0,
+                "score_total": env_score_theme,
+                "signal_score": env_score_theme,
+                "env_score": env_score_theme,
+                "env_bias": str(etf_env.get("etf_env_bias", "")),
+                "env_confidence": float(etf_env.get("etf_env_confidence", 0.0)),
+                "etf_env_bias": str(etf_env.get("etf_env_bias", "")),
+                "etf_env_confidence": float(etf_env.get("etf_env_confidence", 0.0)),
+                "etf_trend_state": str(etf_env.get("etf_trend_state", "")),
+                "flags": "etf_env_row",
+                "notes": "ETF daily env",
+                "role": "etf",
+                "env_score_theme": env_score_theme,
+                "debug": {"source": "step3_etf_env"},
+            }
+        )
+
     for _, r in df_sorted.iterrows():
+        signal_score = float(r.get("signal_score", 0.0))
+        env_score = float(r.get("env_score", 0.0))
         rows.append(
             {
                 "asof_utc": str(r.get("asof_utc")),
                 "theme": str(r.get("theme", theme)),
                 "symbol": str(r.get("symbol", "")),
                 "rank": int(r.get("rank")),
-                "score_total": float(r.get("score_total", 0.0)),
+                "score_total": signal_score,
+                "signal_score": signal_score,
+                "env_score": env_score,
                 "env_bias": str(r.get("env_bias", "")),
                 "env_confidence": float(r.get("env_confidence", 0.0)),
+                "etf_env_bias": str(etf_env.get("etf_env_bias", "")),
+                "etf_env_confidence": float(etf_env.get("etf_env_confidence", 0.0)) if etf_env else 0.0,
+                "etf_trend_state": str(etf_env.get("etf_trend_state", "")),
                 "flags": str(r.get("flags", "")),
                 "notes": "",
+                "role": "symbol",
                 "debug": {"source": "step4_score"},
             }
         )
@@ -116,12 +164,16 @@ def _validate_payload(payload: Dict, schema_path: Optional[Path]) -> Dict:
 def _write_markdown(md_path: Path, rows: List[Dict]) -> None:
     lines: List[str] = []
     lines.append("# Dashboard\n")
-    lines.append("| Rank | Theme | Symbol | Score | Env Bias | Env Conf | Flags |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| Rank | Theme | Symbol | Signal | Env Score | Env Bias | Env Conf | Flags |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for r in rows:
+        sig = r.get("signal_score")
+        env_score = r.get("env_score")
+        sig_str = f"{float(sig):.2f}" if sig is not None and pd.notna(sig) else "-"
+        env_str = f"{float(env_score):.2f}" if env_score is not None and pd.notna(env_score) else "-"
         lines.append(
-            f"| {r['rank']} | {r['theme']} | {r['symbol']} | {r['score_total']:.2f} | "
-            f"{r['env_bias']} | {r['env_confidence']:.2f} | {r.get('flags','')} |"
+            f"| {r['rank']} | {r['theme']} | {r['symbol']} | {sig_str} | {env_str} | "
+            f"{r.get('etf_env_bias') or r['env_bias']} | {r.get('etf_env_confidence') or r['env_confidence']:.2f} | {r.get('flags','')} |"
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -151,7 +203,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as e:
             LOG.warning("Skipping theme=%s due to missing/invalid scores: %s", theme, e)
             continue
-        rows = _build_dashboard_rows(theme, scores)
+        etf_env = _load_etf_env(theme, out_dir)
+        rows = _build_dashboard_rows(theme, scores, etf_env)
         all_rows.extend(rows)
 
     if not all_rows:
@@ -176,32 +229,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Symbol summary
     sym_df = pd.DataFrame(all_rows)
     sym_df = sym_df.rename(columns={"timeframe": "htf_timeframe"}) if "timeframe" in sym_df.columns else sym_df
+    symbols_only = sym_df[sym_df.get("role") != "etf"].copy()
+    symbols_only["signal_score"] = pd.to_numeric(symbols_only.get("signal_score"), errors="coerce")
+    symbols_only["env_score"] = pd.to_numeric(symbols_only.get("env_score"), errors="coerce")
     sym_summary_cols = [
         "theme",
         "symbol",
         "rank",
-        "score_total",
+        "signal_score",
+        "env_score",
         "env_bias",
         "env_confidence",
         "flags",
         "asof_utc",
     ]
-    sym_df[sym_summary_cols].to_csv(dash_dir / "symbol_summary.csv", index=False)
+    if not symbols_only.empty:
+        symbols_only[sym_summary_cols].to_csv(dash_dir / "symbol_summary.csv", index=False)
 
     # Theme summary
     theme_rows = []
-    for theme, g in sym_df.groupby("theme"):
+    for theme, g in symbols_only.groupby("theme"):
         theme_rows.append(
             {
                 "theme": theme,
                 "timeframe": "",
                 "asof_utc": g["asof_utc"].iloc[0] if not g.empty else "",
-                "top_score": g["score_total"].max(),
+                "top_signal_score": g["signal_score"].max() if "signal_score" in g else 0.0,
+                "top_env_score": g["env_score"].max() if "env_score" in g else 0.0,
                 "symbols_ok": g.shape[0],
-                "symbols_missing": int((g["flags"] == "missing_env").sum()) if "flags" in g else 0,
+                "symbols_missing": int(g["flags"].fillna("").str.contains("missing_env").sum()) if "flags" in g else 0,
             }
         )
-    pd.DataFrame(theme_rows).to_csv(dash_dir / "theme_summary.csv", index=False)
+    if theme_rows:
+        pd.DataFrame(theme_rows).to_csv(dash_dir / "theme_summary.csv", index=False)
 
     if not args.no_md:
         _write_markdown(dash_dir / "report.md", all_rows)

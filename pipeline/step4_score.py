@@ -19,6 +19,10 @@ from .common import ensure_dir, now_utc_iso, parse_csv_list, validate_tf_combo
 from .io_step1 import group_symbols_by_theme, load_universe
 
 LOG = logging.getLogger(__name__)
+TREND_STRONG_MIN = 0.65
+VOL_MIN = 0.01
+EXT_MAX = 0.08
+QUALITY_MIN = 0.5
 
 # Minimal inline schema for Step4 outputs (envelope + rows)
 SCORE_SCHEMA = {
@@ -45,17 +49,27 @@ SCORE_SCHEMA = {
         "ScoreRow": {
             "type": "object",
             "additionalProperties": True,
-            "required": ["asof_utc", "theme", "symbol", "score_total", "score_breakdown", "flags"],
+            "required": [
+                "asof_utc",
+                "theme",
+                "symbol",
+                "env_score",
+                "signal_score",
+                "score_total",
+                "score_breakdown",
+                "flags",
+            ],
             "properties": {
                 "asof_utc": {"type": "string"},
                 "theme": {"type": "string"},
                 "symbol": {"type": "string"},
+                "env_score": {"type": "number"},
+                "signal_score": {"type": "number"},
                 "score_total": {"type": "number"},
                 "score_breakdown": {"type": "object"},
                 "score_breakdown_json": {"type": "string"},
                 "env_bias": {"type": "string"},
                 "env_confidence": {"type": "number"},
-                "env_score": {"type": "number"},
                 "flags": {"type": "string"},
                 "debug": {"type": "object"},
             },
@@ -121,101 +135,155 @@ def _load_step3_regime(theme: str, out_dir: Path, htf: str) -> Dict[str, Dict]:
     return m
 
 
-def _score_from_env(env_row: Optional[Dict]) -> Tuple[float, Dict[str, float | str], List[str]]:
-    if not env_row:
-        return 0.0, {"reason": "missing_env"}, ["missing_env"]
+def _load_etf_env(theme: str, out_dir: Path) -> Dict[str, object]:
+    path = out_dir / "step3_etf_env" / f"etf_env_{theme}_1D.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        rows = payload.get("rows", [])
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
 
-    bias = str(env_row.get("env_bias", "neutral")).lower()
-    env_score = float(env_row.get("env_score", 0.0))
-    conf = float(env_row.get("env_confidence", 0.5))
 
-    if bias == "bull":
-        total = 30.0 * conf
-    elif bias == "bear":
-        total = 30.0 * conf * 0.5
-    else:
-        total = 0.0
+def _load_step2_prices(theme: str, out_dir: Path, tf: str) -> Dict[str, pd.DataFrame]:
+    path = out_dir / "step2_prices" / f"prices_{theme}_{tf}.csv"
+    if not path.exists():
+        return {}
+    df = pd.read_csv(path, low_memory=False)
+    if df.empty:
+        return {}
+    df["symbol"] = df["symbol"].astype(str).str.strip().str.upper()
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"]
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.dropna(subset=["date"])
+    df = df.sort_values(["symbol", "date"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["close", "high", "low"])
+    price_map: Dict[str, pd.DataFrame] = {}
+    for sym, g in df.groupby("symbol"):
+        price_map[sym] = g
+    return price_map
 
+
+def _price_metrics(price_df: Optional[pd.DataFrame]) -> Dict[str, float]:
+    base = {"vol_metric": 0.0, "extension_metric": 0.0, "price_quality": 0.0}
+    if price_df is None or price_df.empty:
+        return base
+
+    tail = price_df.tail(60).copy()
+    tail["close"] = pd.to_numeric(tail.get("close"), errors="coerce")
+    tail["high"] = pd.to_numeric(tail.get("high"), errors="coerce")
+    tail["low"] = pd.to_numeric(tail.get("low"), errors="coerce")
+    tail = tail.dropna(subset=["close", "high", "low"])
+    if tail.empty:
+        return base
+
+    close = tail["close"]
+    high = tail["high"]
+    low = tail["low"]
+
+    price_quality = _clamp(len(close) / 60.0, 0.0, 1.0)
+
+    tr: List[float] = []
+    prev_close = None
+    for hi, lo, cl in zip(high.tolist(), low.tolist(), close.tolist()):
+        if prev_close is None:
+            tr.append(hi - lo)
+        else:
+            tr.append(max(hi - lo, abs(hi - prev_close), abs(lo - prev_close)))
+        prev_close = cl
+    vol_metric = 0.0
+    if tr and close.iloc[-1]:
+        vol_metric = float(pd.Series(tr).tail(14).mean() / close.iloc[-1])
+
+    sma = close.rolling(20, min_periods=5).mean().iloc[-1]
+    extension_metric = abs(close.iloc[-1] - sma) / sma if sma else 0.0
+
+    return {
+        "vol_metric": float(vol_metric),
+        "extension_metric": float(extension_metric),
+        "price_quality": float(price_quality),
+    }
+
+
+def _env_score(env_row: Optional[Dict], etf_env: Dict) -> Tuple[float, Dict[str, float | str], List[str]]:
     flags: List[str] = []
-    if bias == "neutral":
-        flags.append("env_neutral")
-    if conf < 0.5:
-        flags.append("env_low_confidence")
+    etf_bias = str(etf_env.get("etf_env_bias", "neutral")).lower() if etf_env else "neutral"
+    etf_conf = float(etf_env.get("etf_env_confidence", 0.0)) if etf_env else 0.0
+    env_bias = str(env_row.get("env_bias", "neutral")).lower() if env_row else "neutral"
+    env_conf = float(env_row.get("env_confidence", 0.0)) if env_row else 0.0
+
+    score = 60.0 * etf_conf
+    bias_bonus = 10.0 if etf_bias == "bull" else (-10.0 if etf_bias == "bear" else 0.0)
+    score += bias_bonus
+    score += 30.0 * env_conf
+
+    if not env_row:
+        align_bonus = -10.0
+        flags.append("missing_env")
+    elif env_bias and etf_bias and env_bias != etf_bias and etf_bias != "neutral":
+        align_bonus = -15.0
+        flags.append("env_bias_mismatch")
+    else:
+        align_bonus = 5.0
+    score += align_bonus
 
     breakdown: Dict[str, float | str] = {
-        "bias": bias,
-        "env_score_input": env_score,
-        "confidence": conf,
-        "env_score_component": total,
+        "etf_env_confidence": etf_conf,
+        "etf_env_bias": etf_bias,
+        "bias_bonus": bias_bonus,
+        "env_confidence": env_conf,
+        "env_bias": env_bias,
+        "alignment_bonus": align_bonus,
     }
-    return _clamp(total, 0.0, 30.0), breakdown, flags
+    return _clamp(score, 0.0, 100.0), breakdown, flags
 
 
-def _score_from_trend(trend_row: Optional[Dict], env_bias: str) -> Tuple[float, Dict[str, float | str], List[str]]:
-    if not trend_row:
-        return 0.0, {"reason": "missing_trend"}, ["trend_misaligned"]
-
-    trend_dir = str(trend_row.get("trend_state", "")).lower()
-    strength = float(trend_row.get("trend_strength", 0.0))
-    bias = env_bias.lower()
-
-    if trend_dir == "up" and bias == "bull":
-        score = 30.0 * strength
-        flags: List[str] = []
-    elif trend_dir == "down" and bias == "bear":
-        score = 30.0 * strength
-        flags = []
-    else:
-        score = 0.0
-        flags = ["trend_misaligned"]
-
-    if strength < 0.4:
-        flags.append("trend_weak")
-
-    breakdown = {
-        "trend_dir": trend_dir,
-        "trend_strength": strength,
-        "trend_score_component": score,
-    }
-    return _clamp(score, 0.0, 30.0), breakdown, flags
-
-
-def _score_from_regime(regime_row: Optional[Dict]) -> Tuple[float, Dict[str, float | str], List[str]]:
-    if not regime_row:
-        return 0.0, {"reason": "missing_regime"}, ["regime_missing"]
-
-    regime_state = str(regime_row.get("regime_state", "")).lower()
+def _signal_score(
+    env_score_val: float,
+    trend_state: str,
+    trend_strength: float,
+    metrics: Dict[str, float],
+) -> Tuple[float, List[Dict[str, float | str]], List[str]]:
+    score = env_score_val
+    adjustments: List[Dict[str, float | str]] = []
     flags: List[str] = []
-    if regime_state.startswith("risk_on"):
-        score = 20.0
-    elif "transition" in regime_state:
-        score = 10.0
-        flags.append("regime_transition")
-    else:
-        score = 0.0
-        flags.append("regime_range")
 
-    breakdown = {
-        "regime_state": regime_state,
-        "regime_score_component": score,
-    }
-    return _clamp(score, 0.0, 20.0), breakdown, flags
-
-
-def _score_signal(env_conf: float, trend_strength: float) -> Tuple[float, Dict[str, float], List[str]]:
-    score = 0.0
-    flags: List[str] = []
-    if trend_strength > 0.6:
+    strong_trend = trend_state in {"up", "down"} and trend_strength >= TREND_STRONG_MIN
+    if strong_trend:
+        adjustments.append({"reason": "trend_supports_entry", "delta": 10.0})
         score += 10.0
     else:
+        adjustments.append(
+            {"reason": "trend_not_strong_for_signal", "delta": -10.0, "trend_strength": trend_strength}
+        )
         flags.append("trend_not_strong_for_signal")
+        score -= 10.0
 
-    if env_conf > 0.7:
-        score += 10.0
-    else:
-        flags.append("env_conf_not_strong_for_signal")
+    vol_metric = float(metrics.get("vol_metric", 0.0))
+    if vol_metric < VOL_MIN:
+        adjustments.append({"reason": "vol_too_low", "delta": -15.0, "vol_metric": vol_metric})
+        flags.append("vol_too_low")
+        score -= 15.0
 
-    return score, {"signal_score_component": score}, flags
+    extension_metric = float(metrics.get("extension_metric", 0.0))
+    if extension_metric > EXT_MAX:
+        adjustments.append({"reason": "extended_move", "delta": -12.0, "extension_metric": extension_metric})
+        flags.append("extended_move")
+        score -= 12.0
+
+    price_quality = float(metrics.get("price_quality", 0.0))
+    if price_quality < QUALITY_MIN:
+        adjustments.append({"reason": "data_quality_low", "delta": -10.0, "price_quality": price_quality})
+        flags.append("data_quality_low")
+        score -= 10.0
+
+    return _clamp(score, 0.0, 100.0), adjustments, flags
 
 
 def _validate_payload(payload: Dict, schema_path: Optional[Path]) -> Dict:
@@ -277,73 +345,87 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         trend_map = _load_step3_trend(theme, out_dir, htf)
         regime_map = _load_step3_regime(theme, out_dir, htf)
+        etf_env = _load_etf_env(theme, out_dir)
+        price_map = _load_step2_prices(theme, out_dir, htf)
 
         records: List[Dict] = []
         for sym in symbols:
             env_row = env_map.get(sym)
             trend_row = trend_map.get(sym)
             regime_row = regime_map.get(sym)
+            price_df = price_map.get(sym)
 
-            env_score, env_breakdown, env_flags = _score_from_env(env_row)
+            env_score_val, env_breakdown, env_flags = _env_score(env_row, etf_env)
             env_bias = str(env_row.get("env_bias")) if env_row else "unknown"
             env_conf = float(env_row.get("env_confidence", 0.0)) if env_row else 0.0
 
-            trend_score, trend_breakdown, trend_flags = _score_from_trend(trend_row, env_bias if env_row else "neutral")
+            trend_state = str(trend_row.get("trend_state", "unknown")).lower() if trend_row else "unknown"
             trend_strength = float(trend_row.get("trend_strength", 0.0)) if trend_row else 0.0
 
-            regime_score, regime_breakdown, regime_flags = _score_from_regime(regime_row)
+            metrics = _price_metrics(price_df)
+            signal_score_val, adjustments, signal_flags = _signal_score(env_score_val, trend_state, trend_strength, metrics)
 
-            signal_score, signal_breakdown, signal_flags = _score_signal(env_conf, trend_strength)
+            flags = list(dict.fromkeys(env_flags + signal_flags))
 
-            total = env_score + trend_score + regime_score + signal_score
-            total = min(100.0, round(total, 1))
+            regime_state = str(regime_row.get("regime_state", "unknown")).lower() if regime_row else "unknown"
 
-            asof = (
-                str(env_row.get("asof_utc"))
-                if env_row and env_row.get("asof_utc")
-                else (str(trend_row.get("asof_utc")) if trend_row and trend_row.get("asof_utc") else now_utc_iso())
-            )
-
-            flags = list(dict.fromkeys(env_flags + trend_flags + regime_flags + signal_flags))
-
-            # Additional flag rules
-            regime_state = str(regime_row.get("regime_state", "")).lower() if regime_row else ""
-            if regime_state == "range":
-                flags.append("regime_range")
-            if trend_score == 0:
-                flags.append("trend_misaligned")
-            if env_conf < 0.5:
-                flags.append("env_low_confidence")
-
-            flags = list(dict.fromkeys(flags))
+            asof_candidates = [
+                env_row.get("asof_utc") if env_row else None,
+                trend_row.get("asof_utc") if trend_row else None,
+                regime_row.get("asof_utc") if regime_row else None,
+            ]
+            if price_df is not None and not price_df.empty:
+                try:
+                    asof_candidates.append(pd.to_datetime(price_df["date"]).max().isoformat())
+                except Exception:
+                    pass
+            asof = next((a for a in asof_candidates if a), now_utc_iso())
 
             breakdown = {
-                "env": env_breakdown,
-                "trend": trend_breakdown,
-                "regime": regime_breakdown,
-                "signal": signal_breakdown,
+                "env_score": env_breakdown,
+                "signal_score": {
+                    "base_env_score": env_score_val,
+                    "trend_state": trend_state,
+                    "trend_strength": trend_strength,
+                    "metrics": metrics,
+                    "adjustments": adjustments,
+                },
+                "etf_env": {
+                    "bias": str(etf_env.get("etf_env_bias", "")),
+                    "confidence": float(etf_env.get("etf_env_confidence", 0.0)) if etf_env else 0.0,
+                },
+                "regime": {
+                    "regime_state": regime_state,
+                    "allowed_direction": regime_row.get("allowed_direction") if regime_row else None,
+                    "position_multiplier": regime_row.get("position_multiplier") if regime_row else None,
+                },
             }
 
             row = {
                 "asof_utc": asof,
                 "theme": theme,
                 "symbol": sym,
-                "score_total": float(total),
+                "env_score": float(env_score_val),
+                "signal_score": float(signal_score_val),
+                "score_total": float(signal_score_val),
                 "score_breakdown": breakdown,
                 "score_breakdown_json": json.dumps(breakdown, ensure_ascii=False),
                 "env_bias": env_bias,
                 "env_confidence": env_conf,
-                "env_score": float(env_row.get("env_score", 0.0)) if env_row else 0.0,
-                "trend_state": trend_row.get("trend_state") if trend_row else "unknown",
+                "trend_state": trend_state,
                 "trend_strength": trend_strength,
-                "regime_state": regime_row.get("regime_state") if regime_row else "unknown",
-                "regime_score_component": regime_score,
-                "flags": ",".join(flags),
+                "regime_state": regime_state,
+                "etf_env_bias": str(etf_env.get("etf_env_bias", "")),
+                "etf_env_confidence": float(etf_env.get("etf_env_confidence", 0.0)) if etf_env else 0.0,
+                "flags": ",".join(flags) if flags else "",
                 "notes": "",
                 "debug": {
                     "env": env_row,
                     "trend": trend_row,
                     "regime": regime_row,
+                    "etf_env": etf_env,
+                    "metrics": metrics,
+                    "adjustments": adjustments,
                 },
             }
             records.append(row)
@@ -369,7 +451,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         df_out = pd.DataFrame(records)
-        df_out = df_out.sort_values(["score_total", "symbol"], ascending=[False, True]).reset_index(drop=True)
+        df_out = df_out.sort_values(["signal_score", "symbol"], ascending=[False, True]).reset_index(drop=True)
         df_out["rank"] = df_out.index + 1
         df_out.to_csv(csv_path, index=False)
 

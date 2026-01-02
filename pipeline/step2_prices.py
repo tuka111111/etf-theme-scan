@@ -151,6 +151,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     for theme in themes:
         symbols = sym_by_theme.get(theme, [])
+        if theme not in symbols:
+            symbols = symbols + [theme]
         if not symbols:
             LOG.warning("No symbols for theme=%s; skipping.", theme)
             continue
