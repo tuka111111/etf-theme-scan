@@ -97,7 +97,7 @@ def _build_dashboard_rows(theme: str, score_rows: List[Dict], etf_env: Dict) -> 
         env_score_theme = round(float(etf_env.get("etf_env_confidence", 0.0)) * 100.0, 1)
         rows.append(
             {
-                "asof_utc": str(etf_env.get("asof_date", "")),
+                "asof_utc": _to_jst_iso(str(etf_env.get("asof_date", ""))),
                 "theme": theme,
                 "symbol": "__ETF__",
                 "rank": 0,
@@ -122,7 +122,7 @@ def _build_dashboard_rows(theme: str, score_rows: List[Dict], etf_env: Dict) -> 
         env_score = float(r.get("env_score", 0.0))
         rows.append(
             {
-                "asof_utc": str(r.get("asof_utc")),
+                "asof_utc": _to_jst_iso(str(r.get("asof_utc"))),
                 "theme": str(r.get("theme", theme)),
                 "symbol": str(r.get("symbol", "")),
                 "rank": int(r.get("rank")),
@@ -159,6 +159,22 @@ def _validate_payload(payload: Dict, schema_path: Optional[Path]) -> Dict:
         more = "" if len(errs) <= 20 else f"\n... ({len(errs)-20} more)"
         raise ValueError("Schema validation failed (inline DASHBOARD_SCHEMA):\n" + "\n".join(lines) + more)
     return payload
+
+
+def _to_jst_iso(val: Optional[str]) -> str:
+    """
+    Convert an arbitrary datetime string to JST ISO8601 (+09:00).
+    Falls back to current time if parsing fails.
+    """
+    try:
+        ts = pd.to_datetime(val) if val else pd.Timestamp.now(tz="UTC")
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+    except Exception:
+        ts = pd.Timestamp.now(tz="UTC")
+    return ts.tz_convert("Asia/Tokyo").isoformat(timespec="seconds")
 
 
 def _write_markdown(md_path: Path, rows: List[Dict]) -> None:
