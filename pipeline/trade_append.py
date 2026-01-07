@@ -68,6 +68,21 @@ def _build_symbol_index(decision: Dict) -> Dict[str, Dict]:
     return idx
 
 
+def _choose_symbol_interactive(candidates: List[tuple[str, Dict]]) -> str:
+    print("Select a symbol:")
+    for i, (_, meta) in enumerate(candidates, start=1):
+        print(f"{i}: {meta.get('symbol')} ({meta.get('theme')}) score={meta.get('score_total')}")
+    while True:
+        choice = input("Enter number: ").strip()
+        if not choice.isdigit():
+            print("Enter a valid number.")
+            continue
+        idx = int(choice)
+        if 1 <= idx <= len(candidates):
+            return candidates[idx - 1][0]
+        print("Out of range.")
+
+
 def _read_existing(csv_path: Path) -> List[Dict[str, str]]:
     if not csv_path.exists():
         return []
@@ -96,6 +111,7 @@ def append_trade(
     date_local: Optional[str] = None,
     source: str = "cli",
     decision_path: str = "./out/step6_decision/decision_latest.json",
+    row_meta: Optional[Dict] = None,
     extra: Optional[Dict] = None,
 ) -> Dict[str, object]:
     """
@@ -112,14 +128,20 @@ def append_trade(
         if not symbol_up:
             return {"ok": False, "error": "Symbol is required"}
 
-        decision = _load_decision(Path(decision_path))
-        idx = _build_symbol_index(decision)
-        meta = idx.get(symbol_up)
+        decision = _load_decision(Path(decision_path)) if decision_path else {}
+        idx = _build_symbol_index(decision) if decision else {}
+        meta = idx.get(symbol_up) or (row_meta or {})
         if not meta:
-            return {"ok": False, "error": f"Symbol {symbol_up} not found in decision picks"}
+            return {"ok": False, "error": f"Symbol {symbol_up} not found in decision picks and no row_meta provided"}
 
-        risk_mode = decision.get("risk_mode", {}).get("mode", "")
-        snapshot_id = decision.get("asof_date_utc") or decision.get("asof_local") or decision.get("generated_at_utc", "")
+        risk_mode = decision.get("risk_mode", {}).get("mode", "") if decision else ""
+        snapshot_id = (
+            decision.get("asof_date_utc")
+            or decision.get("asof_local")
+            or decision.get("generated_at_utc", "")
+            if decision
+            else (row_meta.get("snapshot_id") if row_meta else "")
+        )
 
         record = {
             "timestamp_local": _now_local_iso(),

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .trade_append import append_trade, ACTIONS, _build_symbol_index, _load_decision
+from .trade_append import append_trade, ACTIONS, _build_symbol_index, _load_decision, _choose_symbol_interactive
 
 LOG = logging.getLogger(__name__)
 
