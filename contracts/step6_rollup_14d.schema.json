@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Step6 Rollup 14d",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at_utc",
+    "risk_mode_trail",
+    "tradable_freq",
+    "picks_by_action",
+    "warnings_top"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "generated_at_utc": { "type": "string" },
+    "risk_mode_trail": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["date", "mode"],
+        "additionalProperties": true,
+        "properties": {
+          "date": { "type": "string" },
+          "mode": { "type": "string" },
+          "strength": { "type": ["number", "null"] }
+        }
+      }
+    },
+    "tradable_freq": {
+      "type": "object",
+      "additionalProperties": { "type": "integer" }
+    },
+    "picks_by_action": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["date"],
+        "additionalProperties": true,
+        "properties": {
+          "date": { "type": "string" },
+          "ENTER": { "type": "integer" },
+          "WATCH": { "type": "integer" },
+          "AVOID": { "type": "integer" }
+        }
+      }
+    },
+    "warnings_top": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["flag", "count"],
+        "additionalProperties": false,
+        "properties": {
+          "flag": { "type": "string" },
+          "count": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Step6 Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at_utc",
+    "asof_local",
+    "asof_utc",
+    "themes",
+    "risk_mode",
+    "etf_env",
+    "tradable_themes",
+    "picks",
+    "warnings",
+    "debug"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "generated_at_utc": { "type": "string" },
+    "asof_local": { "type": "string" },
+    "asof_utc": { "type": "string" },
+    "themes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "risk_mode": {
+      "type": "object",
+      "required": ["mode", "strength"],
+      "additionalProperties": true,
+      "properties": {
+        "mode": { "type": "string" },
+        "strength": { "type": "number" }
+      }
+    },
+    "etf_env": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["theme", "env", "score", "flags"],
+        "additionalProperties": true,
+        "properties": {
+          "theme": { "type": "string" },
+          "env": { "type": "string" },
+          "score": { "type": ["number", "null"] },
+          "flags": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "tradable_themes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "picks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["theme", "symbol", "score", "action", "flags"],
+        "additionalProperties": true,
+        "properties": {
+          "theme": { "type": "string" },
+          "symbol": { "type": "string" },
+          "score": { "type": "number" },
+          "env": { "type": "string" },
+          "trend": { "type": "string" },
+          "action": { "type": "string" },
+          "notes": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "flags": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["flag", "count"],
+        "additionalProperties": false,
+        "properties": {
+          "flag": { "type": "string" },
+          "count": { "type": "integer" }
+        }
+      }
+    },
+    "debug": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

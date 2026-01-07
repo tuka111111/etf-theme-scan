@@ -95,9 +95,11 @@ def _build_dashboard_rows(theme: str, score_rows: List[Dict], etf_env: Dict) -> 
     # ETF layer (background info, not mixed with symbols)
     if etf_env:
         env_score_theme = round(float(etf_env.get("etf_env_confidence", 0.0)) * 100.0, 1)
+        etf_asof_utc = str(etf_env.get("asof_utc", etf_env.get("asof_date", "")))
         rows.append(
             {
-                "asof_utc": _to_jst_iso(str(etf_env.get("asof_date", ""))),
+                "asof_utc": etf_asof_utc,
+                "asof_local": _to_jst_iso(etf_asof_utc),
                 "theme": theme,
                 "symbol": "__ETF__",
                 "rank": 0,
@@ -120,9 +122,11 @@ def _build_dashboard_rows(theme: str, score_rows: List[Dict], etf_env: Dict) -> 
     for _, r in df_sorted.iterrows():
         signal_score = float(r.get("signal_score", 0.0))
         env_score = float(r.get("env_score", 0.0))
+        asof_utc_raw = str(r.get("asof_utc"))
         rows.append(
             {
-                "asof_utc": _to_jst_iso(str(r.get("asof_utc"))),
+                "asof_utc": asof_utc_raw,
+                "asof_local": _to_jst_iso(asof_utc_raw),
                 "theme": str(r.get("theme", theme)),
                 "symbol": str(r.get("symbol", "")),
                 "rank": int(r.get("rank")),
