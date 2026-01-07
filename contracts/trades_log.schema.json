@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Trades Log",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "trade_id",
+    "date",
+    "theme",
+    "symbol",
+    "side",
+    "entry",
+    "exit",
+    "risk",
+    "result",
+    "compliance"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "trade_id": { "type": "string" },
+    "date": { "type": "string" },
+    "theme": { "type": "string" },
+    "symbol": { "type": "string" },
+    "side": { "type": "string" },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["time_utc", "price", "reason", "score_total", "flags"],
+      "properties": {
+        "time_utc": { "type": "string" },
+        "price": { "type": "number" },
+        "reason": { "type": "string" },
+        "score_total": { "type": "number" },
+        "flags": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "exit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["time_utc", "price", "reason"],
+      "properties": {
+        "time_utc": { "type": ["string", "null"] },
+        "price": { "type": ["number", "null"] },
+        "reason": { "type": ["string", "null"] }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "planned_r": { "type": ["number", "null"] },
+        "stop_price": { "type": ["number", "null"] }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "type": "string" },
+        "pnl_pct": { "type": ["number", "null"] },
+        "r_multiple": { "type": ["number", "null"] }
+      }
+    },
+    "compliance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deviation", "violations"],
+      "properties": {
+        "deviation": { "type": "boolean" },
+        "violations": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "notes": { "type": "string" },
+    "risk_mode_at_entry": { "type": "string" },
+    "theme_env_at_entry": { "type": "string" }
+  }
+}

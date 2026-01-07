@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Decision Daily Log",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "date",
+    "generated_at_utc",
+    "risk_mode",
+    "risk_strength",
+    "themes",
+    "plan",
+    "action",
+    "compliance"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "date": { "type": "string" },
+    "generated_at_utc": { "type": "string" },
+    "risk_mode": { "type": "string" },
+    "risk_strength": { "type": "number", "minimum": 0 },
+    "themes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["env", "score", "flags"],
+        "properties": {
+          "env": { "type": "string" },
+          "score": { "type": "number", "minimum": 0 },
+          "flags": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tradable_themes", "enter_symbols", "watch_symbols", "avoid_symbols"],
+      "properties": {
+        "tradable_themes": { "type": "array", "items": { "type": "string" } },
+        "enter_symbols": { "type": "array", "items": { "type": "string" } },
+        "watch_symbols": { "type": "array", "items": { "type": "string" } },
+        "avoid_symbols": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executed", "touched_symbols", "trades_count"],
+      "properties": {
+        "executed": { "type": "boolean" },
+        "touched_symbols": { "type": "array", "items": { "type": "string" } },
+        "trades_count": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "string" }
+      }
+    },
+    "compliance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deviation", "violations"],
+      "properties": {
+        "deviation": { "type": "boolean" },
+        "violations": { "type": "array", "items": { "type": "string" } },
+        "emotion_tag": { "type": "string" }
+      }
+    },
+    "source_files": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}
