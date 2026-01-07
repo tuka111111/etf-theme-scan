@@ -6,11 +6,11 @@
   "required": [
     "schema_version",
     "generated_at_utc",
+    "asof_date_utc",
     "asof_local",
-    "asof_utc",
     "themes",
     "risk_mode",
-    "etf_env",
+    "etf_daily_env",
     "tradable_themes",
     "picks",
     "warnings",
@@ -19,8 +19,8 @@
   "properties": {
     "schema_version": { "type": "string" },
     "generated_at_utc": { "type": "string" },
+    "asof_date_utc": { "type": "string" },
     "asof_local": { "type": "string" },
-    "asof_utc": { "type": "string" },
     "themes": {
       "type": "array",
       "items": { "type": "string" }
@@ -34,7 +34,7 @@
         "strength": { "type": "number" }
       }
     },
-    "etf_env": {
+    "etf_daily_env": {
       "type": "array",
       "items": {
         "type": "object",
@@ -56,44 +56,53 @@
       "items": { "type": "string" }
     },
     "picks": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["theme", "symbol", "score", "action", "flags"],
-        "additionalProperties": true,
-        "properties": {
-          "theme": { "type": "string" },
-          "symbol": { "type": "string" },
-          "score": { "type": "number" },
-          "env": { "type": "string" },
-          "trend": { "type": "string" },
-          "action": { "type": "string" },
-          "notes": {
-            "type": "array",
-            "items": { "type": "string" }
-          },
-          "flags": {
-            "type": "array",
-            "items": { "type": "string" }
-          }
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ENTER": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Pick" }
+        },
+        "WATCH": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Pick" }
+        },
+        "AVOID": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Pick" }
         }
       }
     },
     "warnings": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["flag", "count"],
-        "additionalProperties": false,
-        "properties": {
-          "flag": { "type": "string" },
-          "count": { "type": "integer" }
-        }
-      }
+      "type": "object",
+      "additionalProperties": { "type": "integer" }
     },
     "debug": {
       "type": "object",
       "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "Pick": {
+      "type": "object",
+      "required": ["theme", "symbol", "score_total", "env", "trend", "action", "flags"],
+      "additionalProperties": true,
+      "properties": {
+        "theme": { "type": "string" },
+        "symbol": { "type": "string" },
+        "score_total": { "type": "number" },
+        "env": { "type": "string" },
+        "trend": { "type": "string" },
+        "action": { "type": "string" },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "flags": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
     }
   }
 }

@@ -6,6 +6,7 @@
   "required": [
     "schema_version",
     "generated_at_utc",
+    "asof_date_utc_list",
     "risk_mode_trail",
     "tradable_freq",
     "picks_by_action",
@@ -26,6 +27,10 @@
           "strength": { "type": ["number", "null"] }
         }
       }
+    },
+    "asof_date_utc_list": {
+      "type": "array",
+      "items": { "type": "string" }
     },
     "tradable_freq": {
       "type": "object",
