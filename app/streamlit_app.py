@@ -1,9 +1,8 @@
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from pipeline.trade_append import append_trade_action
+from pipeline.io_step6 import normalize_flags
 
 
 @st.cache_data
@@ -157,7 +157,33 @@ def _decision_view(base_out: Path, out_root: Path) -> None:
 
     st.markdown("### Actions")
     last_action = st.session_state.get("last_action", "")
-    asof_date_jst = datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()
+    asof_date_jst = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).date().isoformat()
+
+    if st.session_state.get("last_success"):
+        st.success(st.session_state["last_success"])
+        st.session_state["last_success"] = ""
+    if st.session_state.get("last_warning"):
+        st.warning(st.session_state["last_warning"])
+        st.session_state["last_warning"] = ""
+    if st.session_state.get("last_error"):
+        st.error(st.session_state["last_error"])
+        st.session_state["last_error"] = ""
+
+    def _handle_action(action: str, payload: dict, notes_key: str) -> None:
+        notes = st.session_state.get(notes_key, "")
+        if len(notes) > 255:
+            st.session_state["last_warning"] = "Notes must be 255 characters or fewer."
+            return
+        try:
+            payload = dict(payload)
+            payload["action"] = action
+            payload["notes"] = notes
+            append_trade_action(out_dir=str(out_root), record=payload)
+            st.session_state[notes_key] = ""
+            st.session_state["last_success"] = f"Logged {action} for {payload.get('symbol')}"
+            st.session_state["last_action"] = f"{action} {payload.get('symbol')}"
+        except Exception as e:
+            st.session_state["last_error"] = str(e)
 
     for _, row in sym_rows.iterrows():
         # cols: symbol/theme | score | env | notes | one column per action
@@ -169,32 +195,34 @@ def _decision_view(base_out: Path, out_root: Path) -> None:
         notes_key = f"notes_{asof_date_jst}_{row['theme']}_{row['symbol']}"
         if notes_key not in st.session_state:
             st.session_state[notes_key] = ""
-        note_val = cols[3].text_input("notes", key=notes_key, label_visibility="collapsed")
+        cols[3].text_area("notes", key=notes_key, label_visibility="collapsed", height=64)
+        flags_list = normalize_flags(row.get("flags", ""))
+        disable_enter = any(flag in flags_list for flag in ["data_quality_low", "env_bias_mismatch"])
         for idx, act in enumerate(actions):
             col_idx = 4 + idx
-            if cols[col_idx].button(act, key=f"{act}_{row['symbol']}_{row['theme']}"):
-                try:
-                    path = append_trade_action(
-                        out_dir=str(out_root),
-                        record={
-                            "theme": row.get("theme", ""),
-                            "symbol": row.get("symbol", ""),
-                            "action": act,
-                            "notes": note_val,
-                            "score_total": row.get("score_total", ""),
-                            "env_bias": row.get("env_bias", ""),
-                            "env_confidence": row.get("env_confidence", ""),
-                            "etf_env_bias": row.get("etf_env_bias", ""),
-                            "etf_env_confidence": row.get("etf_env_confidence", ""),
-                            "flags": row.get("flags", ""),
-                            "snapshot_id": decision.get("asof_date_utc", ""),
-                            "source": "streamlit_decision_view",
-                        },
-                    )
-                    st.success(f"Logged {act} for {row['symbol']} ({Path(path).name})")
-                    st.session_state["last_action"] = f"{act} {row['symbol']}"
-                except Exception as e:
-                    st.error(str(e))
+            payload = {
+                "theme": row.get("theme", ""),
+                "symbol": row.get("symbol", ""),
+                "score_total": row.get("score_total", ""),
+                "env_bias": row.get("env_bias", ""),
+                "env_confidence": row.get("env_confidence", ""),
+                "etf_env_bias": row.get("etf_env_bias", ""),
+                "etf_env_confidence": row.get("etf_env_confidence", ""),
+                "flags": row.get("flags", ""),
+                "snapshot_id": decision.get("asof_date_utc", ""),
+                "decision_id": decision.get("asof_local", ""),
+                "source": "streamlit_decision_view",
+            }
+            disabled = disable_enter if act == "ENTER" else False
+            cols[col_idx].button(
+                act,
+                key=f"{act}_{row['symbol']}_{row['theme']}",
+                on_click=_handle_action,
+                args=(act, payload, notes_key),
+                disabled=disabled,
+            )
+        if disable_enter:
+            cols[3].caption("ENTER disabled: data_quality_low/env_bias_mismatch")
 
     if last_action:
         st.info(f"Last action: {last_action}")
@@ -219,6 +247,125 @@ def _decision_view(base_out: Path, out_root: Path) -> None:
         st.write("No actions logged today.")
 
 
+def _decision_log_view(out_root: Path) -> None:
+    st.subheader("Decision Log")
+    trades_dir = out_root / "step7_trades"
+    files = sorted(trades_dir.glob("trade_actions_*.csv"))
+    if not files:
+        st.info("No trade actions found.")
+        return
+
+    frames = []
+    for path in files:
+        try:
+            frames.append(pd.read_csv(path))
+        except Exception as e:
+            st.warning(f"Failed to read {path.name}: {e}")
+    if not frames:
+        return
+
+    df = pd.concat(frames, ignore_index=True)
+    if "status" not in df.columns:
+        df["status"] = "active"
+    if "updated_from_ts_jst" not in df.columns:
+        df["updated_from_ts_jst"] = ""
+    if "decision_id" not in df.columns:
+        df["decision_id"] = ""
+
+    df["action_ts_jst"] = df.get("action_ts_jst", "")
+    df["asof_date_jst"] = df.get("asof_date_jst", "")
+
+    suppressed = set(df.loc[df["status"].isin(["obsolete", "edited"]), "updated_from_ts_jst"].dropna().astype(str))
+    show_obsolete = st.checkbox("Show obsolete/original rows", value=False)
+    if suppressed and not show_obsolete:
+        df = df[~df["action_ts_jst"].astype(str).isin(suppressed)]
+
+    df = df.sort_values("action_ts_jst", ascending=False)
+
+    themes = sorted(df["theme"].dropna().unique().tolist())
+    symbols = sorted(df["symbol"].dropna().unique().tolist())
+    dates = sorted(df["asof_date_jst"].dropna().unique().tolist(), reverse=True)
+
+    col_f1, col_f2, col_f3 = st.columns(3)
+    sel_theme = col_f1.selectbox("Theme", ["ALL"] + themes, index=0)
+    sel_symbol = col_f2.selectbox("Symbol", ["ALL"] + symbols, index=0)
+    sel_date = col_f3.selectbox("Date", ["ALL"] + dates, index=0)
+
+    if sel_theme != "ALL":
+        df = df[df["theme"] == sel_theme]
+    if sel_symbol != "ALL":
+        df = df[df["symbol"] == sel_symbol]
+    if sel_date != "ALL":
+        df = df[df["asof_date_jst"] == sel_date]
+
+    limit = st.slider("Rows to show", 5, 200, 50, 5)
+    view = df.head(limit).reset_index(drop=True)
+
+    if st.session_state.get("log_success"):
+        st.success(st.session_state["log_success"])
+        st.session_state["log_success"] = ""
+    if st.session_state.get("log_warning"):
+        st.warning(st.session_state["log_warning"])
+        st.session_state["log_warning"] = ""
+    if st.session_state.get("log_error"):
+        st.error(st.session_state["log_error"])
+        st.session_state["log_error"] = ""
+
+    def _append_log_action(action_row: dict, new_status: str, new_notes: str) -> None:
+        if len(new_notes) > 255:
+            st.session_state["log_warning"] = "Notes must be 255 characters or fewer."
+            return
+        try:
+            append_trade_action(
+                out_dir=str(out_root),
+                record={
+                    "theme": action_row.get("theme", ""),
+                    "symbol": action_row.get("symbol", ""),
+                    "action": action_row.get("action", ""),
+                    "notes": new_notes,
+                    "score_total": action_row.get("score_total", ""),
+                    "env_bias": action_row.get("env_bias", ""),
+                    "env_confidence": action_row.get("env_confidence", ""),
+                    "etf_env_bias": action_row.get("etf_env_bias", ""),
+                    "etf_env_confidence": action_row.get("etf_env_confidence", ""),
+                    "flags": action_row.get("flags", ""),
+                    "snapshot_id": action_row.get("snapshot_id", ""),
+                    "decision_id": action_row.get("decision_id", ""),
+                    "status": new_status,
+                    "updated_from_ts_jst": action_row.get("action_ts_jst", ""),
+                    "source": "streamlit_decision_log",
+                },
+            )
+            st.session_state["log_success"] = f"{new_status.capitalize()} saved for {action_row.get('symbol')}"
+        except Exception as e:
+            st.session_state["log_error"] = str(e)
+
+    for _, row in view.iterrows():
+        row_dict = row.to_dict()
+        cols = st.columns([1.2, 1.0, 0.8, 0.8, 1.6, 1.2, 1.0, 1.0])
+        cols[0].write(row.get("action_ts_jst", ""))
+        cols[1].write(row.get("theme", ""))
+        cols[2].write(row.get("symbol", ""))
+        cols[3].write(row.get("action", ""))
+        cols[4].write(row.get("status", "active"))
+        edit_key = f"log_notes_{row.get('action_ts_jst','')}_{row.get('symbol','')}"
+        if edit_key not in st.session_state:
+            st.session_state[edit_key] = str(row.get("notes", ""))
+        cols[5].text_area("notes", key=edit_key, label_visibility="collapsed", height=64)
+        cols[6].button(
+            "Update",
+            key=f"update_{row.get('action_ts_jst','')}_{row.get('symbol','')}",
+            on_click=_append_log_action,
+            args=(row_dict, "edited", st.session_state.get(edit_key, "")),
+        )
+        cols[7].button(
+            "Obsolete",
+            key=f"obsolete_{row.get('action_ts_jst','')}_{row.get('symbol','')}",
+            on_click=_append_log_action,
+            args=(row_dict, "obsolete", st.session_state.get(edit_key, "")),
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title="Step5/Decision", layout="wide")
     st.title("Step5 / Decision View")
@@ -227,11 +374,13 @@ def main() -> None:
     base_out = Path(base_out_str)
     out_root = base_out.parent if base_out.name == "step5_dashboard" else Path("out")
 
-    view = st.sidebar.radio("View", ["Dashboard", "Decision View"], index=0)
+    view = st.sidebar.radio("View", ["Dashboard", "Decision View", "Decision Log"], index=0)
     if view == "Dashboard":
         _dashboard_view(base_out)
-    else:
+    elif view == "Decision View":
         _decision_view(base_out, out_root)
+    else:
+        _decision_log_view(out_root)
 
 
 if __name__ == "__main__":

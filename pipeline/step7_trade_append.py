@@ -42,19 +42,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if dash_path.exists():
             df = pd.read_csv(dash_path)
             hit = df[df["symbol"].astype(str).str.upper() == record["symbol"]]
-            if not hit.empty:
-                row = hit.iloc[0].to_dict()
-                record.update(
-                    {
-                        "score_total": row.get("score_total", ""),
-                        "env_bias": row.get("env_bias", ""),
-                        "env_confidence": row.get("env_confidence", ""),
-                        "etf_env_bias": row.get("etf_env_bias", ""),
-                        "etf_env_confidence": row.get("etf_env_confidence", ""),
-                        "flags": row.get("flags", ""),
-                        "snapshot_id": row.get("asof_utc", row.get("asof_local", "")),
-                    }
-                )
+            if hit.empty:
+                raise SystemExit(f"Symbol {record['symbol']} not found in {dash_path}")
+            row = hit.iloc[0].to_dict()
+            record.update(
+                {
+                    "score_total": row.get("score_total", ""),
+                    "env_bias": row.get("env_bias", ""),
+                    "env_confidence": row.get("env_confidence", ""),
+                    "etf_env_bias": row.get("etf_env_bias", ""),
+                    "etf_env_confidence": row.get("etf_env_confidence", ""),
+                    "flags": row.get("flags", ""),
+                    "snapshot_id": row.get("asof_utc", row.get("asof_local", "")),
+                    "decision_id": row.get("asof_local", ""),
+                }
+            )
 
     path = append_trade_action(out_dir=args.out, record=record)
     LOG.info("Appended trade action for %s action=%s to %s", record["symbol"], action, path)

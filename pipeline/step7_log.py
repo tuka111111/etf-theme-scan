@@ -3,12 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import pandas as pd
-from zoneinfo import ZoneInfo
 
 from .common import ensure_dir
 
@@ -18,7 +17,7 @@ ACTIONS = ["ENTER", "WATCH", "SKIP", "EXIT"]
 
 
 def _now_jst() -> datetime:
-    return datetime.now(ZoneInfo("Asia/Tokyo"))
+    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
 
 
 def _load_trade_actions(trades_dir: Path) -> pd.DataFrame:
@@ -43,6 +42,9 @@ def _normalize_actions(df: pd.DataFrame, asof_date_jst: str) -> pd.DataFrame:
     df = df.copy()
     if "action" in df.columns:
         df["action"] = df["action"].astype(str).str.upper()
+    if "status" in df.columns:
+        df["status"] = df["status"].astype(str).str.lower()
+        df = df[~df["status"].isin(["obsolete", "edited"])]
 
     if "action_ts_jst" in df.columns:
         parsed = pd.to_datetime(df["action_ts_jst"], errors="coerce", utc=True)
@@ -133,7 +135,8 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Step7: aggregate trade action logs and rollups.")
     ap.add_argument("--out", required=True, help="Output directory root (expects out/step7_trades)")
-    ap.add_argument("--window", type=int, default=14, help="Window days for rollup")
+    ap.add_argument("--window", type=int, default=14, help="Window days for rollup (deprecated)")
+    ap.add_argument("--rolling-window", type=int, default=None, help="Window days for rollup")
     ap.add_argument("--loglevel", default="INFO")
     args = ap.parse_args(argv)
 
@@ -146,7 +149,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     asof_date_jst = _now_jst().date().isoformat()
     df = _load_trade_actions(trades_dir)
     df = _normalize_actions(df, asof_date_jst)
-    df_window = _filter_window(df, asof_date_jst, args.window)
+    window_days = args.rolling_window if args.rolling_window is not None else args.window
+    df_window = _filter_window(df, asof_date_jst, window_days)
 
     if df.empty or "action_date" not in df.columns:
         daily_df = df
@@ -163,16 +167,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rollup = {
         "schema_version": "step7_rollup_v1",
         "asof_date_jst": asof_date_jst,
-        "window_days": int(args.window),
+        "window_days": int(window_days),
         "theme_action_counts": _theme_action_counts(df_window),
         "top_enter_symbols": _top_enter_symbols(df_window),
         "watch_to_enter_rate_by_theme": _watch_to_enter_counts(df_window),
     }
 
     daily_path = logs_dir / f"daily_summary_{asof_date_jst}.json"
-    rollup_path = logs_dir / f"rollup_{int(args.window)}d_{asof_date_jst}.json"
+    rollup_path = logs_dir / f"rollup_{int(window_days)}d_{asof_date_jst}.json"
+    trade_log_path = logs_dir / "trade_log.json"
     _write_json(daily_path, daily_summary)
     _write_json(rollup_path, rollup)
+    _write_json(trade_log_path, rollup)
 
     LOG.info("Wrote daily summary: %s", daily_path)
     LOG.info("Wrote rollup: %s", rollup_path)

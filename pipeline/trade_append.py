@@ -3,10 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
 
 from .common import ensure_dir
 from .io_step6 import normalize_flags
@@ -31,7 +30,7 @@ COLUMNS = [
     "source",
     "debug_json",
 ]
-TRADE_ACTION_COLUMNS = [
+OLD_TRADE_ACTION_COLUMNS = [
     "schema_version",
     "asof_date_jst",
     "action_ts_jst",
@@ -50,6 +49,29 @@ TRADE_ACTION_COLUMNS = [
     "snapshot_id",
     "debug_json",
 ]
+TRADE_ACTION_COLUMNS = [
+    "schema_version",
+    "asof_date_jst",
+    "action_ts_jst",
+    "created_at_jst",
+    "decision_id",
+    "theme",
+    "symbol",
+    "action",
+    "notes",
+    "score_total",
+    "env_bias",
+    "env_confidence",
+    "etf_env_bias",
+    "etf_env_confidence",
+    "flags",
+    "status",
+    "source",
+    "run_id",
+    "snapshot_id",
+    "updated_from_ts_jst",
+    "debug_json",
+]
 
 
 def _now_local_iso() -> str:
@@ -61,7 +83,7 @@ def _today_local() -> str:
 
 
 def _now_jst() -> datetime:
-    return datetime.now(ZoneInfo("Asia/Tokyo"))
+    return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9)))
 
 
 def _parse_ts_jst(val: Optional[str]) -> datetime:
@@ -70,8 +92,8 @@ def _parse_ts_jst(val: Optional[str]) -> datetime:
     try:
         parsed = datetime.fromisoformat(val)
         if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
-        return parsed.astimezone(ZoneInfo("Asia/Tokyo"))
+            return parsed.replace(tzinfo=timezone(timedelta(hours=9)))
+        return parsed.astimezone(timezone(timedelta(hours=9)))
     except Exception:
         return _now_jst()
 
@@ -138,6 +160,55 @@ def _validate_csv_header(csv_path: Path, columns: List[str]) -> None:
         raise ValueError(f"Missing header in existing CSV: {csv_path}")
     if header != columns:
         raise ValueError(f"CSV header mismatch in {csv_path}. Expected={columns} Actual={header}")
+
+
+def _upgrade_trade_actions_header(csv_path: Path) -> None:
+    if not csv_path.exists():
+        return
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+    if header == TRADE_ACTION_COLUMNS:
+        return
+    if header != OLD_TRADE_ACTION_COLUMNS:
+        raise ValueError(f"CSV header mismatch in {csv_path}. Expected={TRADE_ACTION_COLUMNS} or {OLD_TRADE_ACTION_COLUMNS}")
+
+    rows: List[Dict[str, str]] = []
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_ACTION_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            action_ts = row.get("action_ts_jst", "")
+            writer.writerow(
+                {
+                    "schema_version": row.get("schema_version", "step7_trade_action_v1"),
+                    "asof_date_jst": row.get("asof_date_jst", ""),
+                    "action_ts_jst": action_ts,
+                    "created_at_jst": action_ts,
+                    "decision_id": "",
+                    "theme": row.get("theme", ""),
+                    "symbol": row.get("symbol", ""),
+                    "action": row.get("action", ""),
+                    "notes": row.get("notes", ""),
+                    "score_total": row.get("score_total", ""),
+                    "env_bias": row.get("env_bias", ""),
+                    "env_confidence": row.get("env_confidence", ""),
+                    "etf_env_bias": row.get("etf_env_bias", ""),
+                    "etf_env_confidence": row.get("etf_env_confidence", ""),
+                    "flags": row.get("flags", ""),
+                    "status": "active",
+                    "source": row.get("source", ""),
+                    "run_id": row.get("run_id", ""),
+                    "snapshot_id": row.get("snapshot_id", ""),
+                    "updated_from_ts_jst": "",
+                    "debug_json": row.get("debug_json", ""),
+                }
+            )
 
 
 def _is_duplicate(existing: List[Dict[str, str]], record: Dict[str, str]) -> bool:
@@ -247,21 +318,32 @@ def append_trade_action(out_dir: str, record: Dict[str, Any]) -> str:
 
     action_ts = _parse_ts_jst(record.get("action_ts_jst"))
     action_ts_jst = action_ts.isoformat(timespec="seconds")
+    created_at = _parse_ts_jst(record.get("created_at_jst")) if record.get("created_at_jst") else _now_jst()
+    created_at_jst = created_at.isoformat(timespec="seconds")
     asof_date_jst = action_ts.date().isoformat()
 
     flags_val = record.get("flags", "")
     if isinstance(flags_val, list):
         flags_val = ";".join([str(v) for v in flags_val if str(v).strip()])
-    notes_val = record.get("notes", "")
+    notes_val = str(record.get("notes", "") or "")
+    if len(notes_val) > 255:
+        raise ValueError("notes must be 255 characters or fewer")
+    notes_val = notes_val.replace("\r", " ").replace("\n", " ")
 
     debug_json = record.get("debug_json", "")
     if isinstance(debug_json, (dict, list)):
         debug_json = json.dumps(debug_json, ensure_ascii=False)
 
+    status_val = str(record.get("status", "active") or "active").lower()
+    if status_val not in {"active", "edited", "obsolete"}:
+        raise ValueError(f"Invalid status {status_val}. Allowed: active/edited/obsolete")
+
     row = {
         "schema_version": "step7_trade_action_v1",
         "asof_date_jst": asof_date_jst,
         "action_ts_jst": action_ts_jst,
+        "created_at_jst": created_at_jst,
+        "decision_id": record.get("decision_id", ""),
         "theme": theme,
         "symbol": symbol,
         "action": action,
@@ -272,14 +354,17 @@ def append_trade_action(out_dir: str, record: Dict[str, Any]) -> str:
         "etf_env_bias": record.get("etf_env_bias", ""),
         "etf_env_confidence": record.get("etf_env_confidence", ""),
         "flags": flags_val or "",
+        "status": status_val,
         "source": record.get("source", "streamlit_decision_view"),
         "run_id": record.get("run_id", ""),
         "snapshot_id": record.get("snapshot_id", ""),
+        "updated_from_ts_jst": record.get("updated_from_ts_jst", ""),
         "debug_json": debug_json or "",
     }
 
     out_path = ensure_dir(Path(out_dir) / "step7_trades")
     csv_path = out_path / f"trade_actions_{asof_date_jst}.csv"
+    _upgrade_trade_actions_header(csv_path)
     _validate_csv_header(csv_path, TRADE_ACTION_COLUMNS)
 
     write_header = not csv_path.exists()
