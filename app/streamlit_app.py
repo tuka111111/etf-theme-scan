@@ -1,7 +1,9 @@
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import List
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -11,8 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from pipeline.trade_append import append_trade
-from pipeline.io_step6 import normalize_flags
+from pipeline.trade_append import append_trade_action
 
 
 @st.cache_data
@@ -103,7 +104,7 @@ def _dashboard_view(base_out: Path) -> None:
     st.download_button("Download watchlist", data=watchlist_csv, file_name="watchlist.csv", mime="text/csv")
 
 
-def _decision_view(base_out: Path, trade_out: Path) -> None:
+def _decision_view(base_out: Path, out_root: Path) -> None:
     decision_path = Path("out/step6_decision/decision_latest.json")
     if (base_out / "decision_latest.json").exists():
         decision_path = base_out / "decision_latest.json"
@@ -156,6 +157,7 @@ def _decision_view(base_out: Path, trade_out: Path) -> None:
 
     st.markdown("### Actions")
     last_action = st.session_state.get("last_action", "")
+    asof_date_jst = datetime.now(ZoneInfo("Asia/Tokyo")).date().isoformat()
 
     for _, row in sym_rows.iterrows():
         # cols: symbol/theme | score | env | notes | one column per action
@@ -164,35 +166,57 @@ def _decision_view(base_out: Path, trade_out: Path) -> None:
         cols[0].write(f"{row['symbol']} ({row['theme']})")
         cols[1].write(f"score={row.get('score_total','')}")
         cols[2].write(f"env={row.get('env_bias','')}")
-        notes_key = f"notes_{row['symbol']}_{row['theme']}"
+        notes_key = f"notes_{asof_date_jst}_{row['theme']}_{row['symbol']}"
+        if notes_key not in st.session_state:
+            st.session_state[notes_key] = ""
         note_val = cols[3].text_input("notes", key=notes_key, label_visibility="collapsed")
         for idx, act in enumerate(actions):
             col_idx = 4 + idx
             if cols[col_idx].button(act, key=f"{act}_{row['symbol']}_{row['theme']}"):
-                result = append_trade(
-                    out_dir=str(trade_out.parent),
-                    symbol=row["symbol"],
-                    action=act,
-                    notes=note_val,
-                    source="streamlit_decision_view",
-                    decision_path=str(decision_path),
-                    row_meta={
-                        "theme": row.get("theme", ""),
-                        "score_total": row.get("score_total", ""),
-                        "env": row.get("env_bias", ""),
-                        "trend": row.get("trend", row.get("trend_direction", "")),
-                        "flags": normalize_flags(row.get("flags", "")),
-                        "snapshot_id": decision.get("asof_date_utc", ""),
-                    },
-                )
-                if result.get("ok"):
-                    st.success(f"Logged {act} for {row['symbol']}")
+                try:
+                    path = append_trade_action(
+                        out_dir=str(out_root),
+                        record={
+                            "theme": row.get("theme", ""),
+                            "symbol": row.get("symbol", ""),
+                            "action": act,
+                            "notes": note_val,
+                            "score_total": row.get("score_total", ""),
+                            "env_bias": row.get("env_bias", ""),
+                            "env_confidence": row.get("env_confidence", ""),
+                            "etf_env_bias": row.get("etf_env_bias", ""),
+                            "etf_env_confidence": row.get("etf_env_confidence", ""),
+                            "flags": row.get("flags", ""),
+                            "snapshot_id": decision.get("asof_date_utc", ""),
+                            "source": "streamlit_decision_view",
+                        },
+                    )
+                    st.success(f"Logged {act} for {row['symbol']} ({Path(path).name})")
                     st.session_state["last_action"] = f"{act} {row['symbol']}"
-                else:
-                    st.warning(result.get("error", "append failed"))
+                except Exception as e:
+                    st.error(str(e))
 
     if last_action:
         st.info(f"Last action: {last_action}")
+
+    st.markdown("### Today Actions (latest 10)")
+    today_path = out_root / "step7_trades" / f"trade_actions_{asof_date_jst}.csv"
+    if today_path.exists():
+        try:
+            recent = pd.read_csv(today_path)
+            if "action_ts_jst" in recent.columns:
+                recent = recent.sort_values("action_ts_jst", ascending=False)
+            st.dataframe(
+                recent.head(10)[
+                    ["action_ts_jst", "theme", "symbol", "action", "notes", "score_total", "env_bias"]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
+        except Exception as e:
+            st.error(f"Failed to load today actions: {e}")
+    else:
+        st.write("No actions logged today.")
 
 
 def main() -> None:
@@ -201,13 +225,13 @@ def main() -> None:
 
     base_out_str = st.sidebar.text_input("Out directory", value="out/step5_dashboard")
     base_out = Path(base_out_str)
-    trade_out = Path("out/trade_log/trades.csv")
+    out_root = base_out.parent if base_out.name == "step5_dashboard" else Path("out")
 
     view = st.sidebar.radio("View", ["Dashboard", "Decision View"], index=0)
     if view == "Dashboard":
         _dashboard_view(base_out)
     else:
-        _decision_view(base_out, trade_out)
+        _decision_view(base_out, out_root)
 
 
 if __name__ == "__main__":

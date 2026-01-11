@@ -9,3 +9,5 @@ out/
 *.csv
 AGENTS.md
 env.sh
+
+contracts/*.json

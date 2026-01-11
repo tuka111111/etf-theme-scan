@@ -2,54 +2,62 @@ from __future__ import annotations
 
 import argparse
 import logging
-import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .trade_append import append_trade, ACTIONS, _build_symbol_index, _load_decision, _choose_symbol_interactive
+import pandas as pd
+
+from .trade_append import TRADE_ACTIONS, append_trade_action
 
 LOG = logging.getLogger(__name__)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="Append a trade note to CSV with minimal input (CLI wrapper).")
-    ap.add_argument("--out", required=True, help="Output directory root (writes out/trade_log/trades.csv)")
-    ap.add_argument("--decision", default="./out/step6_decision/decision_latest.json", help="Path to decision_latest.json")
-    ap.add_argument("--symbol", default="", help="Symbol (optional if --interactive)")
-    ap.add_argument("--action", required=True, help="Action enum: ENTER/WATCH/SKIP/EXIT/ADD/REDUCE/AVOID")
+    ap = argparse.ArgumentParser(description="Append a Step7 trade action (append-only).")
+    ap.add_argument("--out", required=True, help="Output directory root (writes out/step7_trades)")
+    ap.add_argument("--theme", required=True, help="Theme (e.g., XME)")
+    ap.add_argument("--symbol", required=True, help="Symbol (e.g., AAPL)")
+    ap.add_argument("--action", required=True, help="Action enum: ENTER/WATCH/SKIP/EXIT")
     ap.add_argument("--notes", default="", help="Optional notes")
-    ap.add_argument("--date", default=None, help="YYYY-MM-DD (default: today)")
-    ap.add_argument("--interactive", action="store_true", help="Pick symbol from latest decision ENTER/WATCH")
+    ap.add_argument("--step5_dir", default="", help="Optional step5_dashboard directory (for auto-fill)")
     ap.add_argument("--loglevel", default="INFO")
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), logging.INFO))
 
-    symbol = args.symbol.strip().upper()
-    if args.interactive:
-        if not sys.stdin.isatty():
-            raise SystemExit("Interactive mode requires a TTY.")
-        decision = _load_decision(Path(args.decision))
-        sym_index = _build_symbol_index(decision)
-        candidates = [(k, v) for k, v in sym_index.items() if v.get("bucket") in {"ENTER", "WATCH"}]
-        if not candidates:
-            raise SystemExit("No ENTER/WATCH symbols available for selection.")
-        from .trade_append import _choose_symbol_interactive  # lazy import to avoid circulars in Streamlit
+    action = args.action.strip().upper()
+    if action not in TRADE_ACTIONS:
+        raise SystemExit(f"Invalid action {action}. Allowed: {sorted(TRADE_ACTIONS)}")
 
-        symbol = _choose_symbol_interactive(candidates)
+    record = {
+        "theme": args.theme.strip().upper(),
+        "symbol": args.symbol.strip().upper(),
+        "action": action,
+        "notes": args.notes or "",
+        "source": "cli",
+    }
 
-    result = append_trade(
-        out_dir=args.out,
-        symbol=symbol,
-        action=args.action.upper(),
-        notes=args.notes,
-        date_local=args.date,
-        source="cli",
-        decision_path=args.decision,
-    )
-    if not result.get("ok"):
-        raise SystemExit(result.get("error", "append failed"))
-    LOG.info("Appended trade note for %s action=%s to %s", symbol or "(interactive)", args.action.upper(), result.get("path"))
+    if args.step5_dir:
+        dash_path = Path(args.step5_dir) / "dashboard.csv"
+        if dash_path.exists():
+            df = pd.read_csv(dash_path)
+            hit = df[df["symbol"].astype(str).str.upper() == record["symbol"]]
+            if not hit.empty:
+                row = hit.iloc[0].to_dict()
+                record.update(
+                    {
+                        "score_total": row.get("score_total", ""),
+                        "env_bias": row.get("env_bias", ""),
+                        "env_confidence": row.get("env_confidence", ""),
+                        "etf_env_bias": row.get("etf_env_bias", ""),
+                        "etf_env_confidence": row.get("etf_env_confidence", ""),
+                        "flags": row.get("flags", ""),
+                        "snapshot_id": row.get("asof_utc", row.get("asof_local", "")),
+                    }
+                )
+
+    path = append_trade_action(out_dir=args.out, record=record)
+    LOG.info("Appended trade action for %s action=%s to %s", record["symbol"], action, path)
     return 0
 
 

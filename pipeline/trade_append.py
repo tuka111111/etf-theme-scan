@@ -5,7 +5,8 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from .common import ensure_dir
 from .io_step6 import normalize_flags
@@ -13,6 +14,7 @@ from .io_step6 import normalize_flags
 LOG = logging.getLogger(__name__)
 
 ACTIONS = {"ENTER", "WATCH", "SKIP", "EXIT", "ADD", "REDUCE", "AVOID"}
+TRADE_ACTIONS = {"ENTER", "WATCH", "SKIP", "EXIT"}
 COLUMNS = [
     "timestamp_local",
     "date_local",
@@ -29,6 +31,25 @@ COLUMNS = [
     "source",
     "debug_json",
 ]
+TRADE_ACTION_COLUMNS = [
+    "schema_version",
+    "asof_date_jst",
+    "action_ts_jst",
+    "theme",
+    "symbol",
+    "action",
+    "notes",
+    "score_total",
+    "env_bias",
+    "env_confidence",
+    "etf_env_bias",
+    "etf_env_confidence",
+    "flags",
+    "source",
+    "run_id",
+    "snapshot_id",
+    "debug_json",
+]
 
 
 def _now_local_iso() -> str:
@@ -37,6 +58,22 @@ def _now_local_iso() -> str:
 
 def _today_local() -> str:
     return datetime.now().date().isoformat()
+
+
+def _now_jst() -> datetime:
+    return datetime.now(ZoneInfo("Asia/Tokyo"))
+
+
+def _parse_ts_jst(val: Optional[str]) -> datetime:
+    if not val:
+        return _now_jst()
+    try:
+        parsed = datetime.fromisoformat(val)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=ZoneInfo("Asia/Tokyo"))
+        return parsed.astimezone(ZoneInfo("Asia/Tokyo"))
+    except Exception:
+        return _now_jst()
 
 
 def _load_decision(decision_path: Path) -> Dict:
@@ -89,6 +126,18 @@ def _read_existing(csv_path: Path) -> List[Dict[str, str]]:
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         return list(reader)
+
+
+def _validate_csv_header(csv_path: Path, columns: List[str]) -> None:
+    if not csv_path.exists():
+        return
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+    if not header:
+        raise ValueError(f"Missing header in existing CSV: {csv_path}")
+    if header != columns:
+        raise ValueError(f"CSV header mismatch in {csv_path}. Expected={columns} Actual={header}")
 
 
 def _is_duplicate(existing: List[Dict[str, str]], record: Dict[str, str]) -> bool:
@@ -179,3 +228,65 @@ def append_trade(
     except Exception as e:
         LOG.exception("append_trade failed")
         return {"ok": False, "error": str(e)}
+
+
+def append_trade_action(out_dir: str, record: Dict[str, Any]) -> str:
+    if not isinstance(record, dict):
+        raise ValueError("record must be a dict")
+
+    action = str(record.get("action", "")).upper().strip()
+    if action not in TRADE_ACTIONS:
+        raise ValueError(f"Invalid action {action}. Allowed: {sorted(TRADE_ACTIONS)}")
+
+    symbol = str(record.get("symbol", "")).strip().upper()
+    theme = str(record.get("theme", "")).strip().upper()
+    if not symbol:
+        raise ValueError("symbol is required")
+    if not theme:
+        raise ValueError("theme is required")
+
+    action_ts = _parse_ts_jst(record.get("action_ts_jst"))
+    action_ts_jst = action_ts.isoformat(timespec="seconds")
+    asof_date_jst = action_ts.date().isoformat()
+
+    flags_val = record.get("flags", "")
+    if isinstance(flags_val, list):
+        flags_val = ";".join([str(v) for v in flags_val if str(v).strip()])
+    notes_val = record.get("notes", "")
+
+    debug_json = record.get("debug_json", "")
+    if isinstance(debug_json, (dict, list)):
+        debug_json = json.dumps(debug_json, ensure_ascii=False)
+
+    row = {
+        "schema_version": "step7_trade_action_v1",
+        "asof_date_jst": asof_date_jst,
+        "action_ts_jst": action_ts_jst,
+        "theme": theme,
+        "symbol": symbol,
+        "action": action,
+        "notes": str(notes_val or ""),
+        "score_total": record.get("score_total", ""),
+        "env_bias": record.get("env_bias", ""),
+        "env_confidence": record.get("env_confidence", ""),
+        "etf_env_bias": record.get("etf_env_bias", ""),
+        "etf_env_confidence": record.get("etf_env_confidence", ""),
+        "flags": flags_val or "",
+        "source": record.get("source", "streamlit_decision_view"),
+        "run_id": record.get("run_id", ""),
+        "snapshot_id": record.get("snapshot_id", ""),
+        "debug_json": debug_json or "",
+    }
+
+    out_path = ensure_dir(Path(out_dir) / "step7_trades")
+    csv_path = out_path / f"trade_actions_{asof_date_jst}.csv"
+    _validate_csv_header(csv_path, TRADE_ACTION_COLUMNS)
+
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=TRADE_ACTION_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+    return str(csv_path)
