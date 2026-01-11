@@ -1,3 +1,4 @@
+import csv
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -12,7 +13,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from pipeline.trade_append import append_trade_action
+from pipeline.trade_append import (
+    OLD_TRADE_ACTION_COLUMNS,
+    TRADE_ACTION_COLUMNS,
+    append_trade_action,
+)
 from pipeline.io_step6 import normalize_flags
 
 
@@ -255,10 +260,55 @@ def _decision_log_view(out_root: Path) -> None:
         st.info("No trade actions found.")
         return
 
+    def _read_trade_actions_csv(path: Path) -> pd.DataFrame:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+        if not header:
+            return pd.DataFrame()
+        if header not in (TRADE_ACTION_COLUMNS, OLD_TRADE_ACTION_COLUMNS):
+            raise ValueError(f"Unexpected CSV header: {header}")
+
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        if header == TRADE_ACTION_COLUMNS:
+            return pd.DataFrame(rows)
+
+        normalized = []
+        for row in rows:
+            action_ts = row.get("action_ts_jst", "")
+            normalized.append(
+                {
+                    "schema_version": row.get("schema_version", "step7_trade_action_v1"),
+                    "asof_date_jst": row.get("asof_date_jst", ""),
+                    "action_ts_jst": action_ts,
+                    "created_at_jst": action_ts,
+                    "decision_id": "",
+                    "theme": row.get("theme", ""),
+                    "symbol": row.get("symbol", ""),
+                    "action": row.get("action", ""),
+                    "notes": row.get("notes", ""),
+                    "score_total": row.get("score_total", ""),
+                    "env_bias": row.get("env_bias", ""),
+                    "env_confidence": row.get("env_confidence", ""),
+                    "etf_env_bias": row.get("etf_env_bias", ""),
+                    "etf_env_confidence": row.get("etf_env_confidence", ""),
+                    "flags": row.get("flags", ""),
+                    "status": "active",
+                    "source": row.get("source", ""),
+                    "run_id": row.get("run_id", ""),
+                    "snapshot_id": row.get("snapshot_id", ""),
+                    "updated_from_ts_jst": "",
+                    "debug_json": row.get("debug_json", ""),
+                }
+            )
+        return pd.DataFrame(normalized)
+
     frames = []
     for path in files:
         try:
-            frames.append(pd.read_csv(path))
+            frames.append(_read_trade_actions_csv(path))
         except Exception as e:
             st.warning(f"Failed to read {path.name}: {e}")
     if not frames:
@@ -278,18 +328,21 @@ def _decision_log_view(out_root: Path) -> None:
     suppressed = set(df.loc[df["status"].isin(["obsolete", "edited"]), "updated_from_ts_jst"].dropna().astype(str))
     show_obsolete = st.checkbox("Show obsolete/original rows", value=False)
     if suppressed and not show_obsolete:
-        df = df[~df["action_ts_jst"].astype(str).isin(suppressed)]
+        mask = df["action_ts_jst"].astype(str).isin(suppressed) & (df["status"] == "active")
+        df = df[~mask]
 
     df = df.sort_values("action_ts_jst", ascending=False)
 
     themes = sorted(df["theme"].dropna().unique().tolist())
     symbols = sorted(df["symbol"].dropna().unique().tolist())
     dates = sorted(df["asof_date_jst"].dropna().unique().tolist(), reverse=True)
+    statuses = sorted(df["status"].dropna().unique().tolist())
 
-    col_f1, col_f2, col_f3 = st.columns(3)
+    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
     sel_theme = col_f1.selectbox("Theme", ["ALL"] + themes, index=0)
     sel_symbol = col_f2.selectbox("Symbol", ["ALL"] + symbols, index=0)
     sel_date = col_f3.selectbox("Date", ["ALL"] + dates, index=0)
+    sel_status = col_f4.selectbox("Status", ["ALL"] + statuses, index=0)
 
     if sel_theme != "ALL":
         df = df[df["theme"] == sel_theme]
@@ -297,6 +350,8 @@ def _decision_log_view(out_root: Path) -> None:
         df = df[df["symbol"] == sel_symbol]
     if sel_date != "ALL":
         df = df[df["asof_date_jst"] == sel_date]
+    if sel_status != "ALL":
+        df = df[df["status"] == sel_status]
 
     limit = st.slider("Rows to show", 5, 200, 50, 5)
     view = df.head(limit).reset_index(drop=True)
@@ -323,6 +378,8 @@ def _decision_log_view(out_root: Path) -> None:
                     "symbol": action_row.get("symbol", ""),
                     "action": action_row.get("action", ""),
                     "notes": new_notes,
+                    "action_ts_jst": action_row.get("action_ts_jst", ""),
+                    "created_at_jst": action_row.get("created_at_jst", action_row.get("action_ts_jst", "")),
                     "score_total": action_row.get("score_total", ""),
                     "env_bias": action_row.get("env_bias", ""),
                     "env_confidence": action_row.get("env_confidence", ""),

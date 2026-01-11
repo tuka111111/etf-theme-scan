@@ -44,6 +44,14 @@ def _normalize_actions(df: pd.DataFrame, asof_date_jst: str) -> pd.DataFrame:
         df["action"] = df["action"].astype(str).str.upper()
     if "status" in df.columns:
         df["status"] = df["status"].astype(str).str.lower()
+        suppressed = set(
+            df.loc[df["status"].isin(["obsolete", "edited"]), "updated_from_ts_jst"]
+            .dropna()
+            .astype(str)
+        )
+        if suppressed and "action_ts_jst" in df.columns:
+            mask = df["action_ts_jst"].astype(str).isin(suppressed) & (df["status"] == "active")
+            df = df[~mask]
         df = df[~df["status"].isin(["obsolete", "edited"])]
 
     if "action_ts_jst" in df.columns:
@@ -68,7 +76,7 @@ def _filter_window(df: pd.DataFrame, asof_date_jst: str, window_days: int) -> pd
 
 
 def _theme_action_counts(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
-    if df.empty:
+    if df.empty or "theme" not in df.columns or "action" not in df.columns:
         return {}
     counts = df.groupby(["theme", "action"]).size().unstack(fill_value=0)
     out: Dict[str, Dict[str, int]] = {}
@@ -78,7 +86,7 @@ def _theme_action_counts(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
 
 
 def _latest_actions_by_symbol(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    if df.empty:
+    if df.empty or "symbol" not in df.columns or "action_ts_jst_parsed" not in df.columns:
         return []
     df_sorted = df.sort_values("action_ts_jst_parsed", ascending=False)
     latest = df_sorted.groupby("symbol", as_index=False).head(1)
@@ -96,7 +104,7 @@ def _latest_actions_by_symbol(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 def _watch_to_enter_counts(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-    if df.empty:
+    if df.empty or "theme" not in df.columns or "action" not in df.columns:
         return {}
     counts: Dict[str, Dict[str, float]] = {}
     grouped = df.sort_values("action_ts_jst_parsed").groupby(["theme", "symbol", "action_date"])
@@ -118,7 +126,7 @@ def _watch_to_enter_counts(df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
 
 
 def _top_enter_symbols(df: pd.DataFrame, top_n: int = 10) -> List[Dict[str, Any]]:
-    if df.empty:
+    if df.empty or "action" not in df.columns or "symbol" not in df.columns or "theme" not in df.columns:
         return []
     enters = df[df["action"] == "ENTER"]
     if enters.empty:

@@ -211,6 +211,10 @@ def _upgrade_trade_actions_header(csv_path: Path) -> None:
             )
 
 
+def ensure_trade_actions_header(csv_path: Path) -> None:
+    ensure_trade_actions_header(csv_path)
+
+
 def _is_duplicate(existing: List[Dict[str, str]], record: Dict[str, str]) -> bool:
     for row in existing:
         if (
@@ -367,11 +371,66 @@ def append_trade_action(out_dir: str, record: Dict[str, Any]) -> str:
     _upgrade_trade_actions_header(csv_path)
     _validate_csv_header(csv_path, TRADE_ACTION_COLUMNS)
 
+    existing_rows: List[Dict[str, str]] = []
+    if csv_path.exists():
+        try:
+            with csv_path.open(newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_rows = list(reader)
+        except Exception as e:
+            raise ValueError(f"Failed to read existing trade actions: {e}")
+
+    decision_id = str(row.get("decision_id") or "").strip()
+    matched_active: List[Dict[str, str]] = []
+    for r in existing_rows:
+        r_symbol = str(r.get("symbol", "")).upper()
+        r_date = str(r.get("asof_date_jst", ""))
+        r_decision_id = str(r.get("decision_id", "") or "").strip()
+        if r_symbol != symbol or r_date != asof_date_jst:
+            continue
+        if decision_id and r_decision_id != decision_id:
+            continue
+        r_status = str(r.get("status", "active") or "active").lower()
+        if r_status in {"obsolete", "edited"}:
+            continue
+        matched_active.append(r)
+
+    if status_val == "active":
+        for r in matched_active:
+            same_action = str(r.get("action", "")).upper() == action
+            same_notes = str(r.get("notes", "") or "") == notes_val
+            if same_action and same_notes:
+                raise ValueError("Duplicate trade action detected for the same symbol/date/decision_id.")
+
+    updated_from_ts = str(record.get("updated_from_ts_jst", "") or "")
+    if not updated_from_ts and matched_active:
+        sorted_matches = sorted(
+            matched_active,
+            key=lambda x: str(x.get("action_ts_jst", "")),
+            reverse=True,
+        )
+        updated_from_ts = str(sorted_matches[0].get("action_ts_jst", ""))
+
+    obsolete_rows: List[Dict[str, str]] = []
+    if status_val == "active" and matched_active:
+        for r in matched_active:
+            obsolete_row = {k: r.get(k, "") for k in TRADE_ACTION_COLUMNS}
+            obsolete_row["status"] = "obsolete"
+            obsolete_row["updated_from_ts_jst"] = r.get("action_ts_jst", "")
+            if not obsolete_row.get("created_at_jst"):
+                obsolete_row["created_at_jst"] = r.get("action_ts_jst", "")
+            obsolete_rows.append(obsolete_row)
+
+    if updated_from_ts:
+        row["updated_from_ts_jst"] = updated_from_ts
+
     write_header = not csv_path.exists()
     with csv_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=TRADE_ACTION_COLUMNS)
         if write_header:
             writer.writeheader()
+        for obsolete_row in obsolete_rows:
+            writer.writerow(obsolete_row)
         writer.writerow(row)
 
     return str(csv_path)
