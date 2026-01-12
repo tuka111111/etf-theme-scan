@@ -32,6 +32,16 @@ def _asof_date_utc(asof_utc: str) -> str:
         return "unknown"
 
 
+def _normalize_asof_utc(val: Optional[str]) -> str:
+    try:
+        ts = pd.to_datetime(val, utc=True) if val else None
+        if ts is None or pd.isna(ts):
+            raise ValueError("empty asof_utc")
+        return ts.isoformat(timespec="seconds").replace("+00:00", "Z")
+    except Exception:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _scale_0_100(val) -> float:
     try:
         v = float(val)
@@ -179,6 +189,42 @@ def _save_files(out_dir: Path, date_str: str, payload: Dict[str, object]) -> Non
     (hist_dir / f"decision_{date_str}.json").write_bytes(json_path.read_bytes())
 
 
+def _save_csv(
+    out_dir: Path,
+    date_str: str,
+    *,
+    asof_utc: str,
+    asof_date: str,
+    picks: Dict[str, List[Dict]],
+) -> None:
+    rows: List[Dict[str, object]] = []
+    for bucket in ["ENTER", "WATCH", "AVOID"]:
+        for p in picks.get(bucket, []) if isinstance(picks, dict) else []:
+            flags = p.get("flags", []) or []
+            notes = p.get("notes", []) or []
+            rows.append(
+                {
+                    "asof_utc": asof_utc,
+                    "asof_date": asof_date,
+                    "symbol": p.get("symbol", "unknown"),
+                    "theme": p.get("theme", "unknown"),
+                    "score_total": p.get("score_total", 0.0),
+                    "env": p.get("env", "unknown"),
+                    "trend": p.get("trend", "unknown"),
+                    "flags": ";".join(flags) if isinstance(flags, list) else str(flags),
+                    "action": p.get("action", bucket),
+                    "notes": ";".join(notes) if isinstance(notes, list) else str(notes),
+                }
+            )
+    df = pd.DataFrame(rows)
+    cols = ["asof_utc", "asof_date", "symbol", "theme", "score_total", "env", "trend", "flags", "action", "notes"]
+    if not df.empty:
+        df = df[cols]
+    csv_path = out_dir / f"decision_{date_str}.csv"
+    df.to_csv(csv_path, index=False)
+    (out_dir / "decision_latest.csv").write_bytes(csv_path.read_bytes())
+
+
 def _load_history(hist_dir: Path, limit_days: int = 14) -> List[Dict]:
     if not hist_dir.exists():
         return []
@@ -261,7 +307,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     picks = _picks(sym_rows, tradable, args.score_col, args.min_score, args.top_n)
     warnings = _warnings(df)
 
-    asof_date_utc = _asof_date_utc(asof_utc)
+    asof_utc_norm = _normalize_asof_utc(asof_utc)
+    asof_date_utc = _asof_date_utc(asof_utc_norm)
     date_str = asof_date_utc if asof_date_utc != "unknown" else (asof_local[:10] if isinstance(asof_local, str) and len(asof_local) >= 10 else "unknown")
 
     payload: Dict[str, object] = {
@@ -269,6 +316,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "generated_at_utc": _now_utc_iso(),
         "asof_date_utc": asof_date_utc,
         "asof_local": asof_local,
+        "asof_utc": asof_utc_norm,
         "themes": sorted(etf_env_df["theme"].unique().tolist()),
         "risk_mode": risk,
         "etf_daily_env": [
@@ -294,6 +342,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_root = ensure_dir(Path(args.out) / "step6_decision")
     try:
         _save_files(out_root, date_str, payload)
+        _save_csv(out_root, date_str, asof_utc=asof_utc_norm, asof_date=asof_date_utc, picks=picks)
     except Exception as e:
         raise SystemExit(f"Failed to write decision outputs: {e}")
 
