@@ -14,7 +14,7 @@ LOG = logging.getLogger(__name__)
 
 ACTIONS = {"ENTER", "WATCH", "SKIP", "EXIT", "ADD", "REDUCE", "AVOID"}
 TRADE_ACTIONS = {"ENTER", "WATCH", "SKIP", "EXIT"}
-COLUMNS = [
+OLD_TRADE_LOG_COLUMNS = [
     "timestamp_local",
     "date_local",
     "symbol",
@@ -30,6 +30,7 @@ COLUMNS = [
     "source",
     "debug_json",
 ]
+COLUMNS = OLD_TRADE_LOG_COLUMNS + ["threshold_used", "rules_applied", "score_adjusted"]
 OLD_TRADE_ACTION_COLUMNS = [
     "schema_version",
     "asof_date_jst",
@@ -71,6 +72,9 @@ TRADE_ACTION_COLUMNS = [
     "snapshot_id",
     "updated_from_ts_jst",
     "debug_json",
+    "threshold_used",
+    "rules_applied",
+    "score_adjusted",
 ]
 
 
@@ -147,7 +151,40 @@ def _read_existing(csv_path: Path) -> List[Dict[str, str]]:
         return []
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        return list(reader)
+    return list(reader)
+
+
+def _upgrade_trade_log_header(csv_path: Path) -> None:
+    if not csv_path.exists():
+        return
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+    if not header:
+        raise ValueError(f"Missing header in existing CSV: {csv_path}")
+    if header == COLUMNS:
+        return
+    if header != OLD_TRADE_LOG_COLUMNS:
+        raise ValueError(f"CSV header mismatch in {csv_path}. Expected={COLUMNS} or {OLD_TRADE_LOG_COLUMNS}")
+
+    rows: List[Dict[str, str]] = []
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {
+                    **{k: row.get(k, "") for k in OLD_TRADE_LOG_COLUMNS},
+                    "threshold_used": row.get("threshold_used", ""),
+                    "rules_applied": row.get("rules_applied", ""),
+                    "score_adjusted": row.get("score_adjusted", ""),
+                }
+            )
 
 
 def _validate_csv_header(csv_path: Path, columns: List[str]) -> None:
@@ -170,8 +207,10 @@ def _upgrade_trade_actions_header(csv_path: Path) -> None:
         header = next(reader, None)
     if header == TRADE_ACTION_COLUMNS:
         return
-    if header != OLD_TRADE_ACTION_COLUMNS:
-        raise ValueError(f"CSV header mismatch in {csv_path}. Expected={TRADE_ACTION_COLUMNS} or {OLD_TRADE_ACTION_COLUMNS}")
+    if header not in (OLD_TRADE_ACTION_COLUMNS, TRADE_ACTION_COLUMNS[:-3]):
+        raise ValueError(
+            f"CSV header mismatch in {csv_path}. Expected={TRADE_ACTION_COLUMNS} or {OLD_TRADE_ACTION_COLUMNS}"
+        )
 
     rows: List[Dict[str, str]] = []
     with csv_path.open(newline="", encoding="utf-8") as f:
@@ -189,8 +228,8 @@ def _upgrade_trade_actions_header(csv_path: Path) -> None:
                     "schema_version": row.get("schema_version", "step7_trade_action_v1"),
                     "asof_date_jst": row.get("asof_date_jst", ""),
                     "action_ts_jst": action_ts,
-                    "created_at_jst": action_ts,
-                    "decision_id": "",
+                    "created_at_jst": row.get("created_at_jst", action_ts),
+                    "decision_id": row.get("decision_id", ""),
                     "theme": row.get("theme", ""),
                     "symbol": row.get("symbol", ""),
                     "action": row.get("action", ""),
@@ -201,12 +240,15 @@ def _upgrade_trade_actions_header(csv_path: Path) -> None:
                     "etf_env_bias": row.get("etf_env_bias", ""),
                     "etf_env_confidence": row.get("etf_env_confidence", ""),
                     "flags": row.get("flags", ""),
-                    "status": "active",
+                    "status": row.get("status", "active"),
                     "source": row.get("source", ""),
                     "run_id": row.get("run_id", ""),
                     "snapshot_id": row.get("snapshot_id", ""),
-                    "updated_from_ts_jst": "",
+                    "updated_from_ts_jst": row.get("updated_from_ts_jst", ""),
                     "debug_json": row.get("debug_json", ""),
+                    "threshold_used": row.get("threshold_used", ""),
+                    "rules_applied": row.get("rules_applied", ""),
+                    "score_adjusted": row.get("score_adjusted", ""),
                 }
             )
 
@@ -282,6 +324,9 @@ def append_trade(
             "notes": notes or "",
             "source": source,
             "debug_json": json.dumps(extra) if extra else "",
+            "threshold_used": meta.get("threshold_used", ""),
+            "rules_applied": ";".join(meta.get("rules_applied", [])) if meta.get("rules_applied") else "",
+            "score_adjusted": meta.get("score_adjusted", ""),
         }
 
         trade_dir = ensure_dir(Path(out_dir) / "trade_log")
@@ -289,6 +334,7 @@ def append_trade(
         monthly_path = trade_dir / f"trades_{record['date_local'].replace('-', '')[:6]}.csv"
 
         for path in (csv_path, monthly_path):
+            _upgrade_trade_log_header(path)
             existing = _read_existing(path)
             if _is_duplicate(existing, record):
                 return {"ok": False, "error": f"Duplicate entry detected in {path} for symbol={symbol_up} action={action_up} snapshot={snapshot_id}"}
@@ -364,6 +410,9 @@ def append_trade_action(out_dir: str, record: Dict[str, Any]) -> str:
         "snapshot_id": record.get("snapshot_id", ""),
         "updated_from_ts_jst": record.get("updated_from_ts_jst", ""),
         "debug_json": debug_json or "",
+        "threshold_used": record.get("threshold_used", ""),
+        "rules_applied": record.get("rules_applied", ""),
+        "score_adjusted": record.get("score_adjusted", ""),
     }
 
     out_path = ensure_dir(Path(out_dir) / "step7_trades")

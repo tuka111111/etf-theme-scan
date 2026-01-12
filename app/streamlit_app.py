@@ -125,6 +125,22 @@ def _decision_view(base_out: Path, out_root: Path) -> None:
         st.error(f"Failed to read decision: {e}")
         return
 
+    def _decision_pick_index(payload: dict) -> dict:
+        idx = {}
+        picks = payload.get("picks", {})
+        if isinstance(picks, dict):
+            for bucket, rows in picks.items():
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    symbol = str(row.get("symbol", "")).upper()
+                    if not symbol:
+                        continue
+                    idx[symbol] = row
+        return idx
+
+    decision_idx = _decision_pick_index(decision)
+
     st.subheader("Decision Snapshot")
     st.write(
         f"asof_date_utc: {decision.get('asof_date_utc','unknown')} | risk_mode: "
@@ -218,6 +234,13 @@ def _decision_view(base_out: Path, out_root: Path) -> None:
                 "decision_id": decision.get("asof_local", ""),
                 "source": "streamlit_decision_view",
             }
+            pick_meta = decision_idx.get(str(row.get("symbol", "")).upper(), {})
+            rules_applied = pick_meta.get("rules_applied", "")
+            if isinstance(rules_applied, list):
+                rules_applied = ";".join(rules_applied)
+            payload["threshold_used"] = pick_meta.get("threshold_used", "")
+            payload["rules_applied"] = rules_applied or ""
+            payload["score_adjusted"] = pick_meta.get("score_adjusted", "")
             disabled = disable_enter if act == "ENTER" else False
             cols[col_idx].button(
                 act,
@@ -381,6 +404,7 @@ def _decision_log_view(out_root: Path) -> None:
                     "action_ts_jst": action_row.get("action_ts_jst", ""),
                     "created_at_jst": action_row.get("created_at_jst", action_row.get("action_ts_jst", "")),
                     "score_total": action_row.get("score_total", ""),
+                    "score_adjusted": action_row.get("score_adjusted", ""),
                     "env_bias": action_row.get("env_bias", ""),
                     "env_confidence": action_row.get("env_confidence", ""),
                     "etf_env_bias": action_row.get("etf_env_bias", ""),
@@ -390,6 +414,8 @@ def _decision_log_view(out_root: Path) -> None:
                     "decision_id": action_row.get("decision_id", ""),
                     "status": new_status,
                     "updated_from_ts_jst": action_row.get("action_ts_jst", ""),
+                    "threshold_used": action_row.get("threshold_used", ""),
+                    "rules_applied": action_row.get("rules_applied", ""),
                     "source": "streamlit_decision_log",
                 },
             )

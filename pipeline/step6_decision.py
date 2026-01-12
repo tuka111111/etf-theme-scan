@@ -90,7 +90,142 @@ def _tradable_themes(etf_df: pd.DataFrame, risk_mode: str) -> List[str]:
     return etf_df[(etf_df["env"].str.lower() == "bull") & (etf_df["score"] >= 60)]["theme"].tolist()
 
 
-def _picks(sym_rows: pd.DataFrame, tradable: List[str], score_col: str, min_score: float, top_n: int) -> Dict[str, List[Dict]]:
+def _parse_scoring_yaml(path: Path) -> Dict[str, float]:
+    if not path.exists():
+        return {}
+    thresholds: Dict[str, float] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    in_thresholds = False
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("thresholds:"):
+            in_thresholds = True
+            continue
+        if not in_thresholds or ":" not in line:
+            continue
+        key, val = [p.strip() for p in line.split(":", 1)]
+        key = key.strip('"')
+        try:
+            thresholds[key] = float(val)
+        except Exception:
+            continue
+    return thresholds
+
+
+def _parse_rules_yaml(path: Path) -> Dict[str, object]:
+    rules = {
+        "flags": {"ignore": [], "weight": {}},
+        "env_bias": {
+            "bull": {"action": "allow", "score_adjust": 0},
+            "neutral": {"action": "allow", "score_adjust": 0},
+            "bear": {"action": "allow", "score_adjust": 0},
+        },
+    }
+    if not path.exists():
+        return rules
+    lines = path.read_text(encoding="utf-8").splitlines()
+    section = None
+    sub = None
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("flags:"):
+            section = "flags"
+            sub = None
+            continue
+        if line.startswith("env_bias:"):
+            section = "env_bias"
+            sub = None
+            continue
+        if section == "flags" and line.startswith("ignore:"):
+            sub = "ignore"
+            continue
+        if section == "flags" and line.startswith("weight:"):
+            sub = "weight"
+            continue
+        if section == "flags" and sub == "ignore" and line.startswith("-"):
+            rules["flags"]["ignore"].append(line.lstrip("-").strip())
+            continue
+        if section == "flags" and sub == "weight" and ":" in line:
+            k, v = [p.strip() for p in line.split(":", 1)]
+            try:
+                rules["flags"]["weight"][k] = float(v)
+            except Exception:
+                continue
+            continue
+        if section == "env_bias" and ":" in line and not line.startswith("-"):
+            key = line.split(":", 1)[0].strip()
+            rules["env_bias"].setdefault(key, {"action": "allow", "score_adjust": 0})
+            sub = key
+            continue
+        if section == "env_bias" and sub in rules["env_bias"] and ":" in line:
+            k, v = [p.strip() for p in line.split(":", 1)]
+            if k == "score_adjust":
+                try:
+                    rules["env_bias"][sub][k] = float(v)
+                except Exception:
+                    pass
+            elif k == "action":
+                rules["env_bias"][sub][k] = v
+    return rules
+
+
+def _apply_rules(
+    *,
+    score: float,
+    flags: List[str],
+    env_bias: str,
+    threshold: Optional[float],
+    horizon: str,
+    rules: Dict[str, object],
+) -> Dict[str, object]:
+    rules_applied: List[str] = []
+    adjusted_score = float(score)
+    ignore_flags = set(rules.get("flags", {}).get("ignore", []))
+    weight_flags = rules.get("flags", {}).get("weight", {})
+
+    if any(f in ignore_flags for f in flags):
+        rules_applied.append("flags_ignore")
+
+    for f in flags:
+        if f in weight_flags:
+            adjusted_score *= float(weight_flags[f])
+            rules_applied.append(f"flag_weight:{f}")
+
+    env_key = (env_bias or "unknown").lower()
+    env_rule = rules.get("env_bias", {}).get(env_key, {"action": "allow", "score_adjust": 0})
+    score_adjust = float(env_rule.get("score_adjust", 0))
+    if score_adjust:
+        adjusted_score += score_adjust
+        rules_applied.append(f"env_adjust:{env_key}")
+    if env_rule.get("action") == "skip":
+        rules_applied.append(f"env_skip:{env_key}")
+
+    threshold_used = f"{horizon}={threshold}" if threshold is not None else f"{horizon}=missing"
+
+    return {
+        "score_adjusted": round(adjusted_score, 4),
+        "rules_applied": rules_applied,
+        "threshold_used": threshold_used,
+        "env_skip": env_rule.get("action") == "skip",
+        "ignored": any(f in ignore_flags for f in flags),
+    }
+
+
+def _picks(
+    sym_rows: pd.DataFrame,
+    tradable: List[str],
+    score_col: str,
+    min_score: float,
+    top_n: int,
+    *,
+    horizon: str,
+    threshold: Optional[float],
+    rules: Dict[str, object],
+) -> Dict[str, List[Dict]]:
     df = sym_rows.copy()
     df = df[df["theme"].isin(tradable)]
     df = df[pd.to_numeric(df[score_col], errors="coerce") >= min_score]
@@ -99,26 +234,49 @@ def _picks(sym_rows: pd.DataFrame, tradable: List[str], score_col: str, min_scor
     buckets = {"ENTER": [], "WATCH": [], "AVOID": []}
     for _, row in df.iterrows():
         flags = normalize_flags(row.get("flags"))
-        action = "ENTER"
+        action = "BUY"
         notes: List[str] = []
         if any(f in MAJOR_EXCLUDE_FLAGS for f in flags):
             action = "AVOID"
             notes.append("data issue")
-        elif any(f in WATCH_FLAGS for f in flags):
-            action = "WATCH"
-            notes.append("monitor flag")
+        else:
+            rules_out = _apply_rules(
+                score=_scale_0_100(row.get(score_col, 0.0)),
+                flags=flags,
+                env_bias=row.get("env", "unknown"),
+                threshold=threshold,
+                horizon=horizon,
+                rules=rules,
+            )
+            adjusted = rules_out["score_adjusted"]
+            if rules_out["ignored"] or rules_out["env_skip"]:
+                action = "WATCH"
+                notes.append("rules skip")
+            elif threshold is None:
+                action = "WATCH"
+                notes.append("threshold missing")
+            elif adjusted < float(threshold):
+                action = "WATCH"
+                notes.append("below threshold")
+            elif any(f in WATCH_FLAGS for f in flags):
+                action = "WATCH"
+                notes.append("monitor flag")
         if not notes:
             notes.append("clean")
-        buckets[action].append(
+        bucket_key = "ENTER" if action == "BUY" else action
+        buckets[bucket_key].append(
             {
                 "symbol": row.get("symbol", "unknown"),
                 "theme": row.get("theme", "unknown"),
                 "score_total": _scale_0_100(row.get(score_col, 0.0)),
+                "score_adjusted": rules_out["score_adjusted"] if "rules_out" in locals() else _scale_0_100(row.get(score_col, 0.0)),
                 "env": row.get("env", "unknown"),
                 "trend": row.get("trend", row.get("trend_direction", "unknown")),
                 "action": action,
                 "flags": flags,
                 "notes": notes,
+                "threshold_used": rules_out["threshold_used"] if "rules_out" in locals() else f"{horizon}={threshold}",
+                "rules_applied": rules_out["rules_applied"] if "rules_out" in locals() else [],
             }
         )
     return buckets
@@ -209,15 +367,32 @@ def _save_csv(
                     "symbol": p.get("symbol", "unknown"),
                     "theme": p.get("theme", "unknown"),
                     "score_total": p.get("score_total", 0.0),
+                    "score_adjusted": p.get("score_adjusted", p.get("score_total", 0.0)),
                     "env": p.get("env", "unknown"),
                     "trend": p.get("trend", "unknown"),
                     "flags": ";".join(flags) if isinstance(flags, list) else str(flags),
                     "action": p.get("action", bucket),
                     "notes": ";".join(notes) if isinstance(notes, list) else str(notes),
+                    "threshold_used": p.get("threshold_used", ""),
+                    "rules_applied": ";".join(p.get("rules_applied", [])),
                 }
             )
     df = pd.DataFrame(rows)
-    cols = ["asof_utc", "asof_date", "symbol", "theme", "score_total", "env", "trend", "flags", "action", "notes"]
+    cols = [
+        "asof_utc",
+        "asof_date",
+        "symbol",
+        "theme",
+        "score_total",
+        "score_adjusted",
+        "env",
+        "trend",
+        "flags",
+        "action",
+        "notes",
+        "threshold_used",
+        "rules_applied",
+    ]
     if not df.empty:
         df = df[cols]
     csv_path = out_dir / f"decision_{date_str}.csv"
@@ -280,6 +455,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--top-n", type=int, default=10, help="Number of symbols to include")
     ap.add_argument("--score-col", default="score_total", help="Score column name for symbols")
     ap.add_argument("--dashboard", default="./out/step5_dashboard/dashboard.csv", help="Path to dashboard.csv")
+    ap.add_argument("--config-dir", default="config", help="Config directory (scoring.yaml, rules.yaml)")
+    ap.add_argument("--horizon", default="20D", help="Horizon key for thresholds (e.g., 1D,5D,20D)")
     ap.add_argument("--loglevel", default="INFO")
     args = ap.parse_args(argv)
 
@@ -304,7 +481,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     etf_env_df = _build_etf_env(etf_rows)
     risk = _risk_mode(etf_env_df)
     tradable = _tradable_themes(etf_env_df, risk["mode"])
-    picks = _picks(sym_rows, tradable, args.score_col, args.min_score, args.top_n)
+
+    config_dir = Path(args.config_dir)
+    scoring = _parse_scoring_yaml(config_dir / "scoring.yaml")
+    rules = _parse_rules_yaml(config_dir / "rules.yaml")
+    threshold = scoring.get(args.horizon)
+
+    picks = _picks(
+        sym_rows,
+        tradable,
+        args.score_col,
+        args.min_score,
+        args.top_n,
+        horizon=args.horizon,
+        threshold=threshold,
+        rules=rules,
+    )
     warnings = _warnings(df)
 
     asof_utc_norm = _normalize_asof_utc(asof_utc)
@@ -312,11 +504,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     date_str = asof_date_utc if asof_date_utc != "unknown" else (asof_local[:10] if isinstance(asof_local, str) and len(asof_local) >= 10 else "unknown")
 
     payload: Dict[str, object] = {
-        "schema_version": "1.0.0",
+        "schema_version": "1.1.0",
         "generated_at_utc": _now_utc_iso(),
         "asof_date_utc": asof_date_utc,
         "asof_local": asof_local,
         "asof_utc": asof_utc_norm,
+        "thresholds": scoring,
+        "rules": rules,
         "themes": sorted(etf_env_df["theme"].unique().tolist()),
         "risk_mode": risk,
         "etf_daily_env": [

@@ -55,6 +55,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "flags": row.get("flags", ""),
                     "snapshot_id": row.get("asof_utc", row.get("asof_local", "")),
                     "decision_id": row.get("asof_local", ""),
+                    "threshold_used": row.get("threshold_used", ""),
+                    "rules_applied": row.get("rules_applied", ""),
+                    "score_adjusted": row.get("score_adjusted", ""),
                 }
             )
 

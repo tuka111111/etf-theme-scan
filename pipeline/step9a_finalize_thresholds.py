@@ -75,6 +75,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--min_sample", type=int, default=30)
     ap.add_argument("--min_win_rate", type=float, default=0.55)
     ap.add_argument("--out", required=True, help="Output JSON path (e.g., out/step9/thresholds_final.json)")
+    ap.add_argument("--write-scoring", default="", help="Optional scoring.yaml path to update from thresholds")
     ap.add_argument("--loglevel", default="INFO")
     args = ap.parse_args(argv)
 
@@ -150,6 +151,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     rationale_path = out_path.parent / "thresholds_rationale.md"
     rationale_path.write_text("\n".join(rationale_lines) + "\n", encoding="utf-8")
+
+    if args.write_scoring:
+        scoring_path = Path(args.write_scoring)
+        ensure_dir(scoring_path.parent)
+        lines = ["thresholds:"]
+        for h, data in output.items():
+            lines.append(f"  \"{h}D\": {data.get('threshold')}")
+        scoring_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        LOG.info("wrote scoring.yaml to %s", scoring_path)
 
     LOG.info("wrote %s", out_path)
     return 0

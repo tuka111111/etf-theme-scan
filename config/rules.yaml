@@ -1,0 +1,18 @@
+flags:
+  ignore:
+    - data_quality_low
+    - halted
+    - bad_symbol
+  weight:
+    trend_not_strong_for_signal: 0.8
+    env_bias_mismatch: 0.7
+env_bias:
+  bull:
+    action: allow
+    score_adjust: 0
+  neutral:
+    action: allow
+    score_adjust: -5
+  bear:
+    action: skip
+    score_adjust: -10
