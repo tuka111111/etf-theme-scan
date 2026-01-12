@@ -106,6 +106,10 @@ LLM を用いたコメント生成を行います。
 出力は Markdown 形式で、ダッシュボードのスナップショットとともに実運用レポートに組み込めます。
 
 
+Step8 validates whether score thresholds and environments
+have statistically meaningful edge, based on realized ETF returns.
+
+
 最後に（重要）
 --------------
 このシステムは「考えなくていいことを増やす」ためのもの。  
