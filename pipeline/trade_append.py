@@ -254,7 +254,8 @@ def _upgrade_trade_actions_header(csv_path: Path) -> None:
 
 
 def ensure_trade_actions_header(csv_path: Path) -> None:
-    ensure_trade_actions_header(csv_path)
+    _upgrade_trade_actions_header(csv_path)
+    _validate_csv_header(csv_path, TRADE_ACTION_COLUMNS)
 
 
 def _is_duplicate(existing: List[Dict[str, str]], record: Dict[str, str]) -> bool:
