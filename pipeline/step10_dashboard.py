@@ -125,9 +125,9 @@ def main() -> None:
     decision_path = _short_path(summary.get("decision_path", ""))
 
     header_cols = st.columns(3)
-    header_cols[0].markdown(f"**asof_date_utc**: {asof_date}  \\n**generated_at_utc**: {generated_at}")
+    header_cols[0].markdown(f"**asof_date_utc**: {asof_date}  \n**generated_at_utc**: {generated_at}")
     header_cols[1].markdown(f"**risk_mode**: {risk_mode_label}")
-    header_cols[2].markdown(f"**decision_hash**: {decision_hash}  \\n**decision_path**: {decision_path}")
+    header_cols[2].markdown(f"**decision_hash**: {decision_hash}  \n**decision_path**: {decision_path}")
 
     no_trade = summary.get("no_trade", {}) if isinstance(summary.get("no_trade", {}), dict) else {}
     is_no_trade = bool(no_trade.get("is_no_trade", True)) if summary else True

@@ -1,4 +1,3 @@
-import csv
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -21,7 +20,7 @@ from pipeline.trade_append import (
 from pipeline.io_step6 import normalize_flags
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_dashboard(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     # normalize types
@@ -110,12 +109,13 @@ def _dashboard_view(base_out: Path) -> None:
 
 
 def _decision_view(base_out: Path, out_root: Path) -> None:
-    decision_path = Path("out/step6_decision/decision_latest.json")
-    if (base_out / "decision_latest.json").exists():
-        decision_path = base_out / "decision_latest.json"
-    elif decision_path.exists():
-        pass
-    else:
+    decision_candidates = [
+        out_root / "step6_decision" / "decision_latest.json",
+        Path("out/step6_decision/decision_latest.json"),
+        base_out / "decision_latest.json",
+    ]
+    decision_path = next((p for p in decision_candidates if p.exists()), None)
+    if not decision_path:
         st.error("decision_latest.json not found (out/step6_decision/decision_latest.json).")
         return
 
@@ -143,10 +143,12 @@ def _decision_view(base_out: Path, out_root: Path) -> None:
 
     st.subheader("Decision Snapshot")
     st.write(
-        f"asof_date_utc: {decision.get('asof_date_utc','unknown')} | risk_mode: "
+        f"asof_date_utc: {decision.get('asof_date_utc','unknown')} | asof_utc: {decision.get('asof_utc','unknown')} | "
+        f"generated_at_utc: {decision.get('generated_at_utc','unknown')} | risk_mode: "
         f"{decision.get('risk_mode',{}).get('mode','unknown')} "
         f"(strength={decision.get('risk_mode',{}).get('strength','')})"
     )
+    st.caption(f"decision_path: {decision_path}")
     st.write(f"tradable_themes: {', '.join(decision.get('tradable_themes',[])) or 'none'}")
 
     # load dashboard for detailed rows
@@ -282,51 +284,76 @@ def _decision_log_view(out_root: Path) -> None:
     if not files:
         st.info("No trade actions found.")
         return
+    required_cols = [
+        "asof_date_jst",
+        "action_ts_jst",
+        "created_at_jst",
+        "decision_id",
+        "theme",
+        "symbol",
+        "action",
+        "notes",
+        "score_total",
+        "env_bias",
+        "env_confidence",
+        "etf_env_bias",
+        "etf_env_confidence",
+        "flags",
+        "status",
+        "source",
+        "run_id",
+        "snapshot_id",
+        "updated_from_ts_jst",
+        "debug_json",
+    ]
 
     def _read_trade_actions_csv(path: Path) -> pd.DataFrame:
-        with path.open(newline="", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            header = next(reader, None)
-        if not header:
-            return pd.DataFrame()
-        if header not in (TRADE_ACTION_COLUMNS, OLD_TRADE_ACTION_COLUMNS):
-            raise ValueError(f"Unexpected CSV header: {header}")
+        df = pd.read_csv(path, encoding="utf-8-sig")
+        df.columns = [str(col).strip() for col in df.columns]
+        actual_cols = set(df.columns)
+        missing = set(required_cols) - actual_cols
 
-        with path.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
-        if header == TRADE_ACTION_COLUMNS:
-            return pd.DataFrame(rows)
+        if missing:
+            old_cols = {str(col).strip() for col in OLD_TRADE_ACTION_COLUMNS}
+            if old_cols.issubset(actual_cols):
+                normalized = []
+                for row in df.to_dict(orient="records"):
+                    action_ts = row.get("action_ts_jst", "")
+                    normalized.append(
+                        {
+                            "schema_version": row.get("schema_version", "step7_trade_action_v1"),
+                            "asof_date_jst": row.get("asof_date_jst", ""),
+                            "action_ts_jst": action_ts,
+                            "created_at_jst": action_ts,
+                            "decision_id": "",
+                            "theme": row.get("theme", ""),
+                            "symbol": row.get("symbol", ""),
+                            "action": row.get("action", ""),
+                            "notes": row.get("notes", ""),
+                            "score_total": row.get("score_total", ""),
+                            "env_bias": row.get("env_bias", ""),
+                            "env_confidence": row.get("env_confidence", ""),
+                            "etf_env_bias": row.get("etf_env_bias", ""),
+                            "etf_env_confidence": row.get("etf_env_confidence", ""),
+                            "flags": row.get("flags", ""),
+                            "status": "active",
+                            "source": row.get("source", ""),
+                            "run_id": row.get("run_id", ""),
+                            "snapshot_id": row.get("snapshot_id", ""),
+                            "updated_from_ts_jst": "",
+                            "debug_json": row.get("debug_json", ""),
+                        }
+                    )
+                df = pd.DataFrame(normalized)
+            else:
+                missing_list = sorted(missing)
+                actual_list = sorted(actual_cols)
+                raise ValueError(f"Missing columns: {missing_list}. Actual columns: {actual_list}")
 
-        normalized = []
-        for row in rows:
-            action_ts = row.get("action_ts_jst", "")
-            normalized.append(
-                {
-                    "schema_version": row.get("schema_version", "step7_trade_action_v1"),
-                    "asof_date_jst": row.get("asof_date_jst", ""),
-                    "action_ts_jst": action_ts,
-                    "created_at_jst": action_ts,
-                    "decision_id": "",
-                    "theme": row.get("theme", ""),
-                    "symbol": row.get("symbol", ""),
-                    "action": row.get("action", ""),
-                    "notes": row.get("notes", ""),
-                    "score_total": row.get("score_total", ""),
-                    "env_bias": row.get("env_bias", ""),
-                    "env_confidence": row.get("env_confidence", ""),
-                    "etf_env_bias": row.get("etf_env_bias", ""),
-                    "etf_env_confidence": row.get("etf_env_confidence", ""),
-                    "flags": row.get("flags", ""),
-                    "status": "active",
-                    "source": row.get("source", ""),
-                    "run_id": row.get("run_id", ""),
-                    "snapshot_id": row.get("snapshot_id", ""),
-                    "updated_from_ts_jst": "",
-                    "debug_json": row.get("debug_json", ""),
-                }
-            )
-        return pd.DataFrame(normalized)
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = ""
+        return df
 
     frames = []
     for path in files:
@@ -377,7 +404,14 @@ def _decision_log_view(out_root: Path) -> None:
         df = df[df["status"] == sel_status]
 
     limit = st.slider("Rows to show", 5, 200, 50, 5)
-    view = df.head(limit).reset_index(drop=True)
+    display_cols = required_cols[:]
+    if "schema_version" in df.columns:
+        display_cols = ["schema_version"] + display_cols
+    for col in display_cols:
+        if col not in df.columns:
+            df[col] = ""
+    ordered_cols = display_cols + [col for col in df.columns if col not in display_cols]
+    view = df[ordered_cols].head(limit).reset_index(drop=True)
 
     if st.session_state.get("log_success"):
         st.success(st.session_state["log_success"])
@@ -454,6 +488,8 @@ def main() -> None:
     st.title("Step5 / Decision View")
 
     base_out_str = st.sidebar.text_input("Out directory", value="out/step5_dashboard")
+    if st.sidebar.button("Reload data"):
+        st.cache_data.clear()
     base_out = Path(base_out_str)
     out_root = base_out.parent if base_out.name == "step5_dashboard" else Path("out")
 
