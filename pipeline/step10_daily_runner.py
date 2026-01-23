@@ -200,12 +200,39 @@ def _enter_symbols_hash(enter_symbols: List[str]) -> str:
     return hashlib.sha1(data.encode("utf-8")).hexdigest()[:10]
 
 
+def _build_common_payload(
+    summary: dict,
+    event_id: str,
+    decision_id: str,
+    decision_hash: str,
+    risk_mode: dict,
+) -> dict:
+    return {
+        "event_id": event_id,
+        "decision_id": decision_id,
+        "decision_hash": decision_hash,
+        "risk_mode": risk_mode,
+        "generated_at_utc": summary.get("generated_at_utc", ""),
+    }
+
+
+def _safe_watchlist_path(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "N/A"
+    if value.startswith("/"):
+        return "N/A"
+    return value
+
+
 def build_notification_message(summary: dict, max_enter: int) -> str:
     risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
     mode = risk_mode.get("mode", "unknown")
     strength = risk_mode.get("strength", 0)
     asof_date = summary.get("asof_date_utc", "")
-    lines: List[str] = [f"{mode}({strength}) | asof={asof_date}"]
+    agent = summary.get("agent", {}) if isinstance(summary.get("agent", {}), dict) else {}
+    agent_verdict = agent.get("verdict", "NO_TRADE")
+    agent_reason = agent.get("reason", "")
+    lines: List[str] = [f"AGENT: {agent_verdict}", f"{mode}({strength}) | asof={asof_date}"]
 
     enter_candidates = summary.get("enter_candidates", [])
     if isinstance(enter_candidates, list):
@@ -229,6 +256,8 @@ def build_notification_message(summary: dict, max_enter: int) -> str:
             lines.append(line)
     else:
         lines.append("今日は何もしない日です（NO TRADE）")
+        if agent_reason:
+            lines.append(f"reason: {agent_reason}")
 
     digest = summary.get("decision_digest", {}) if isinstance(summary.get("decision_digest", {}), dict) else {}
     decision_id = digest.get("decision_id", "")
@@ -236,12 +265,12 @@ def build_notification_message(summary: dict, max_enter: int) -> str:
     if isinstance(decision_hash, str) and len(decision_hash) > 12:
         decision_hash = decision_hash[:12]
     generated_at = summary.get("generated_at_utc", "")
-    watchlist_path = summary.get("watchlist_path", "N/A")
+    watchlist_path = _safe_watchlist_path(summary.get("watchlist_path", "N/A"))
     lines.append(f"decision_id={decision_id}")
     lines.append(f"decision_hash={decision_hash}")
     lines.append(f"generated_at_utc={generated_at}")
     lines.append(f"watchlist_path={watchlist_path}")
-    return "\n".join(lines[: 2 + max_enter + 4])
+    return "\n".join(lines[: 3 + max_enter + 4])
 
 
 def post_discord(webhook_url: str, content: str) -> tuple[bool, Optional[int], Optional[str]]:
@@ -264,78 +293,62 @@ def post_discord(webhook_url: str, content: str) -> tuple[bool, Optional[int], O
         return False, None, str(e)
 
 
-def build_agent_verdict(summary: dict, decision_payload: Optional[dict], max_enter: int) -> dict:
+def build_agent_verdict(summary: dict) -> dict:
     enter_candidates = summary.get("enter_candidates", []) if isinstance(summary.get("enter_candidates", []), list) else []
     enter_count = len(enter_candidates)
-    checks: List[dict] = []
+    risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
+    risk_mode_value = str(risk_mode.get("mode", "")).upper()
 
-    enter_exists_pass = enter_count > 0
-    checks.append(
-        {
-            "id": "enter_exists",
-            "pass": enter_exists_pass,
-            "severity": "info",
-            "message": "ENTER candidates > 0" if enter_exists_pass else "ENTER candidates = 0",
-        }
-    )
-
-    ignore_flags: List[str] = []
-    if decision_payload and isinstance(decision_payload.get("rules", {}), dict):
-        flags_cfg = decision_payload.get("rules", {}).get("flags", {})
-        if isinstance(flags_cfg, dict) and isinstance(flags_cfg.get("ignore"), list):
-            ignore_flags = [str(x) for x in flags_cfg.get("ignore", []) if str(x)]
-    if not ignore_flags:
-        ignore_flags = ["halted", "bad_symbol", "data_quality_low"]
-
-    critical_found: List[str] = []
-    for row in enter_candidates[:max_enter]:
-        flags_short = []
+    blocking_flags = {"data_quality_low", "halted", "bad_symbol"}
+    found_blocking: List[str] = []
+    for row in enter_candidates:
         flags = row.get("flags", [])
         if isinstance(flags, list):
-            flags_short = [str(x) for x in flags if str(x)]
+            items = [str(x) for x in flags if str(x)]
         elif isinstance(flags, str) and flags:
-            flags_short = [flags]
-        for flag in flags_short:
-            if flag in ignore_flags:
-                critical_found.append(flag)
-    critical_pass = len(critical_found) == 0
-    checks.append(
+            items = [flags]
+        else:
+            items = []
+        for flag in items:
+            if flag in blocking_flags:
+                found_blocking.append(flag)
+
+    enter_exists_ok = enter_count > 0
+    no_blocking_ok = len(found_blocking) == 0
+    risk_mode_ok = risk_mode_value != "RISK_OFF"
+
+    checks = [
+        {"id": "enter_exists", "ok": enter_exists_ok, "detail": f"enter_count={enter_count}"},
         {
-            "id": "critical_flags_absent",
-            "pass": critical_pass,
-            "severity": "critical",
-            "message": "no critical flags" if critical_pass else f"critical flags present: {sorted(set(critical_found))}",
-        }
-    )
+            "id": "no_blocking_flags",
+            "ok": no_blocking_ok,
+            "detail": "no blocking flags" if no_blocking_ok else "blocking flag present",
+        },
+        {"id": "risk_mode_allows", "ok": risk_mode_ok, "detail": f"risk_mode={risk_mode_value or 'unknown'}"},
+    ]
 
-    env_bias = ""
-    if decision_payload:
-        env_bias = str(decision_payload.get("env_bias", "")).lower()
-    env_pass = env_bias != "bear"
-    checks.append(
-        {
-            "id": "env_bear_skip",
-            "pass": env_pass,
-            "severity": "critical",
-            "message": "env_bias is not bear" if env_pass else "env_bias=bear",
-        }
-    )
+    failed_checks = [c["id"] for c in checks if not c["ok"]]
 
-    verdict = "NO_TRADE"
-    reason = "ENTER candidates = 0"
-    if enter_count > 0:
-        verdict = "ENTER_OK"
-        reason = "ENTER candidates present"
-
-    critical_fail = [c for c in checks if c["severity"] == "critical" and not c["pass"]]
-    if critical_fail:
-        verdict = "NO_TRADE"
-        reason = critical_fail[0]["message"]
-    elif enter_count == 0:
-        verdict = "NO_TRADE"
+    if not enter_exists_ok:
         reason = "ENTER candidates = 0"
+    elif not no_blocking_ok:
+        reason = "blocking flag present"
+    elif not risk_mode_ok:
+        reason = "risk_mode disallows"
+    else:
+        reason = "checks passed"
 
-    return {"verdict": verdict, "reason": reason, "checks": checks}
+    verdict = "ENTER_OK" if (enter_exists_ok and no_blocking_ok and risk_mode_ok) else "NO_TRADE"
+
+    return {
+        "schema_version": "agent_v1",
+        "verdict": verdict,
+        "reason": reason,
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "computed_at_utc": _now_utc_iso(),
+        "source": "step10_agent_rules_v1",
+    }
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -371,6 +384,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "enter_candidates": [],
         "no_trade": {"is_no_trade": True, "reason": "decision missing"},
         "decision_digest": {"decision_hash": "", "decision_id": "", "enter_symbols": []},
+        "message_preview": "",
         "warnings": [],
     }
 
@@ -433,8 +447,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "decision_id": decision_id,
         "enter_symbols": enter_symbols,
     }
+    summary["debug_step10"] = {
+        "enter_candidates_len": len(enter_candidates),
+        "enter_symbols_len": len(enter_symbols),
+    }
 
-    summary["agent"] = build_agent_verdict(summary, decision_payload, args.notify_max_enter)
+    summary["agent"] = build_agent_verdict(summary)
 
     today_trades = _read_trades(trades_dir, asof_date)
     trade_enter_symbols = sorted(
@@ -487,6 +505,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         deviation["decision_enter_symbols"] = []
         deviation["deviations_today"] = []
 
+    alerts_path = out_dir / "alerts.jsonl"
+    existing_keys = _read_alerts(alerts_path)
+    decision_hash = summary.get("decision_digest", {}).get("decision_hash", "")
+    decision_id = summary.get("decision_digest", {}).get("decision_id", "")
+    risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
+    event_id_run_summary = f"{asof_date}:{decision_id}:RUN_SUMMARY"
+    agent = summary.get("agent", {}) if isinstance(summary.get("agent", {}), dict) else {}
+    agent_checks = agent.get("checks", []) if isinstance(agent.get("checks", []), list) else []
+    agent_failed_checks = agent.get("failed_checks", []) if isinstance(agent.get("failed_checks", []), list) else []
+
+    notify_enabled = bool(args.notify)
+    notify_channel = str(args.notify_channel).lower()
+    notify_max_enter = args.notify_max_enter
+    notify_dry_run = bool(args.notify_dry_run)
+    notify_also_no_trade = bool(args.notify_also_no_trade)
+    webhook_url = str(args.discord_webhook).strip()
+
+    message = build_notification_message(summary, notify_max_enter)
+    if isinstance(message, str):
+        summary["message_preview"] = " / ".join(message.splitlines()[:3])
+    else:
+        summary["message_preview"] = ""
+
     summary_path = out_dir / f"summary_{asof_date}.json"
     deviation_path = out_dir / f"deviation_{asof_date}.json"
     summary_latest = out_dir / "summary_latest.json"
@@ -497,62 +538,50 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary_latest.write_text(summary_path.read_text(encoding="utf-8"), encoding="utf-8")
     deviation_latest.write_text(deviation_path.read_text(encoding="utf-8"), encoding="utf-8")
 
-    alerts_path = out_dir / "alerts.jsonl"
-    existing_keys = _read_alerts(alerts_path)
-    decision_hash = summary.get("decision_digest", {}).get("decision_hash", "")
-    decision_id = summary.get("decision_digest", {}).get("decision_id", "")
-    risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
-    event_id_run_summary = f"{asof_date}:{decision_id}:RUN_SUMMARY"
-
     _append_alert(
         alerts_path,
         event_id_run_summary,
         "RUN_SUMMARY",
         {
             "asof_date_utc": asof_date,
-            "event_id": event_id_run_summary,
-            "decision_id": decision_id,
-            "decision_hash": decision_hash,
-            "risk_mode": risk_mode,
+            **_build_common_payload(summary, event_id_run_summary, decision_id, decision_hash, risk_mode),
             "enter_candidates": len(enter_candidates),
             "trade_enter_symbols": len(trade_enter_symbols),
+            "trade_enter_symbols_count": len(trade_enter_symbols),
+            "counts": summary.get("counts", {}),
+            "result_detail": "logged_only",
+            "agent_verdict": agent.get("verdict"),
+            "agent_reason": agent.get("reason"),
+            "agent_failed_checks": agent_failed_checks,
+            "agent_checks": agent_checks,
         },
         existing_keys,
         dedup_key=f"{asof_date}:RUN_SUMMARY",
     )
 
-    notify_enabled = bool(args.notify)
-    notify_channel = str(args.notify_channel).lower()
-    notify_max_enter = args.notify_max_enter
-    notify_dry_run = bool(args.notify_dry_run)
-    notify_also_no_trade = bool(args.notify_also_no_trade)
-    webhook_url = str(args.discord_webhook).strip()
-
     if deviations_today:
+        deviation_event_id = f"{asof_date}:{decision_id}:DEVIATION_WARN"
         _append_alert(
             alerts_path,
-            f"{asof_date}:{decision_id}:DEVIATION_WARN",
+            deviation_event_id,
             "DEVIATION_WARN",
             {
                 "asof_date_utc": asof_date,
-                "event_id": f"{asof_date}:{decision_id}:DEVIATION_WARN",
-                "decision_id": decision_id,
-                "decision_hash": decision_hash,
-                "risk_mode": risk_mode,
+                **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
                 "count": len(deviations_today),
+                "deviation_today_count": len(deviations_today),
+                "deviation_types": sorted({d.get("type") for d in deviations_today if d.get("type")}),
+                "result_detail": "logged_only",
+                "agent_verdict": agent.get("verdict"),
+                "agent_reason": agent.get("reason"),
+                "agent_failed_checks": agent_failed_checks,
+                "agent_checks": agent_checks,
             },
             existing_keys,
             dedup_key=f"{asof_date}:DEVIATION_WARN",
         )
 
-    message = build_notification_message(summary, notify_max_enter)
-    agent = summary.get("agent", {}) if isinstance(summary.get("agent", {}), dict) else {}
-    agent_checks = agent.get("checks", []) if isinstance(agent.get("checks", []), list) else []
-    agent_checks_failed = [
-        {"id": c.get("id"), "severity": c.get("severity"), "message": c.get("message")}
-        for c in agent_checks
-        if not c.get("pass")
-    ]
+    enter_symbols_unique = sorted(set(enter_symbols))
 
     enter_event_id = f"{asof_date}:{decision_id}:{_enter_symbols_hash(enter_symbols)}"
     if enter_candidates:
@@ -574,11 +603,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 send_result = "logged_only"
         payload = {
             "asof_date_utc": asof_date,
-            "event_id": enter_event_id,
-            "decision_id": decision_id,
-            "decision_hash": decision_hash,
-            "risk_mode": risk_mode,
+            **_build_common_payload(summary, enter_event_id, decision_id, decision_hash, risk_mode),
             "enter_count": len(enter_candidates),
+            "enter_symbols": enter_symbols_unique,
             "enter_top": [
                 {
                     "symbol": row.get("symbol", ""),
@@ -587,15 +614,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "score_adjusted": row.get("score_adjusted", ""),
                     "threshold_used": row.get("threshold_used", ""),
                     "flags": row.get("flags", []),
+                    "rules_applied": row.get("rules_applied", []),
                 }
                 for row in enter_candidates[:notify_max_enter]
             ],
             "message": message,
             "channel": "discord",
             "send_result": send_result,
+            "watchlist_path": _safe_watchlist_path(summary.get("watchlist_path", "N/A")),
+            "result_detail": send_result,
             "agent_verdict": agent.get("verdict"),
             "agent_reason": agent.get("reason"),
-            "agent_checks_failed": agent_checks_failed,
+            "agent_failed_checks": agent_failed_checks,
+            "agent_checks": agent_checks,
         }
         if send_error:
             payload["send_error"] = send_error
@@ -627,17 +658,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     send_error = f"{err or 'send_failed'}"
         payload = {
             "asof_date_utc": asof_date,
-            "event_id": no_trade_event_id,
-            "decision_id": decision_id,
-            "decision_hash": decision_hash,
-            "risk_mode": risk_mode,
+            **_build_common_payload(summary, no_trade_event_id, decision_id, decision_hash, risk_mode),
             "reason": summary["no_trade"].get("reason", ""),
             "message": message,
             "channel": "discord",
             "send_result": send_result,
+            "result_detail": send_result,
             "agent_verdict": agent.get("verdict"),
             "agent_reason": agent.get("reason"),
-            "agent_checks_failed": agent_checks_failed,
+            "agent_failed_checks": agent_failed_checks,
+            "agent_checks": agent_checks,
         }
         if send_error:
             payload["send_error"] = send_error
