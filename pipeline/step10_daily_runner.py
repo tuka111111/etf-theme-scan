@@ -8,7 +8,7 @@ import logging
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
@@ -224,6 +224,114 @@ def _safe_watchlist_path(value: object) -> str:
     return value
 
 
+def _window_dates(asof_date_utc: str, window_days: int) -> List[str]:
+    try:
+        base = datetime.fromisoformat(asof_date_utc).date()
+    except Exception:
+        return []
+    if window_days <= 0:
+        return []
+    dates = [(base - timedelta(days=i)).isoformat() for i in range(window_days)]
+    return list(reversed(dates))
+
+
+def _read_deviation_days_from_alerts(alerts_path: Path, window_dates: List[str]) -> Optional[dict]:
+    if not alerts_path.exists():
+        return None
+    deviation_days: set[str] = set()
+    unknown_symbol_days: set[str] = set()
+    no_trade_ignored_days: set[str] = set()
+    try:
+        with alerts_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                kind = record.get("kind", "")
+                if kind not in {"DEVIATION_WARN", "DEVIATION_CRITICAL", "DEVIATION_EVENT"}:
+                    continue
+                payload = record.get("payload", {}) if isinstance(record.get("payload", {}), dict) else {}
+                asof = payload.get("asof_date_utc") or record.get("asof_date_utc")
+                if asof not in window_dates:
+                    continue
+                deviation_days.add(asof)
+                deviation_types = payload.get("deviation_types", [])
+                if isinstance(deviation_types, list):
+                    if "unknown_symbol_enter" in deviation_types:
+                        unknown_symbol_days.add(asof)
+                    if "no_trade_ignored" in deviation_types:
+                        no_trade_ignored_days.add(asof)
+        return {
+            "deviation_days": deviation_days,
+            "unknown_symbol_days": unknown_symbol_days,
+            "no_trade_ignored_days": no_trade_ignored_days,
+            "unknown_symbol_events": 0,
+            "no_trade_ignored_events": 0,
+            "source": "alerts",
+        }
+    except Exception:
+        return None
+
+
+def _read_deviation_days_from_files(out_dir: Path, window_dates: List[str]) -> Optional[dict]:
+    deviation_days: set[str] = set()
+    unknown_symbol_days: set[str] = set()
+    no_trade_ignored_days: set[str] = set()
+    unknown_symbol_events = 0
+    no_trade_ignored_events = 0
+    found_any = False
+    for day in window_dates:
+        path = out_dir / f"deviation_{day}.json"
+        if not path.exists():
+            continue
+        found_any = True
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        deviations = payload.get("deviations_today", [])
+        if not isinstance(deviations, list):
+            continue
+        if deviations:
+            deviation_days.add(day)
+        for row in deviations:
+            dtype = row.get("type")
+            details = row.get("details", {}) if isinstance(row.get("details", {}), dict) else {}
+            if dtype == "unknown_symbol_enter" or details.get("unknown_symbol") is True:
+                unknown_symbol_days.add(day)
+                unknown_symbol_events += 1
+            if dtype in {"no_trade_ignored", "enter_when_no_trade"}:
+                no_trade_ignored_days.add(day)
+                no_trade_ignored_events += 1
+    if not found_any:
+        return None
+    return {
+        "deviation_days": deviation_days,
+        "unknown_symbol_days": unknown_symbol_days,
+        "no_trade_ignored_days": no_trade_ignored_days,
+        "unknown_symbol_events": unknown_symbol_events,
+        "no_trade_ignored_events": no_trade_ignored_events,
+        "source": "files",
+    }
+
+
+def _compute_streak(days_set: set[str], window_dates: List[str]) -> int:
+    max_streak = 0
+    streak = 0
+    for day in window_dates:
+        if day in days_set:
+            streak += 1
+            if streak > max_streak:
+                max_streak = streak
+        else:
+            streak = 0
+    return max_streak
+
+
 def build_notification_message(summary: dict, max_enter: int) -> str:
     risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
     mode = risk_mode.get("mode", "unknown")
@@ -389,16 +497,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
 
     deviation: Dict[str, object] = {
-        "schema_version": "step10_deviation_v1",
+        "schema_version": "step10_deviation_v2",
         "generated_at_utc": _now_utc_iso(),
         "asof_date_utc": "",
         "window_days": args.window_days,
+        "window_detail": {},
+        "window_start_date": "",
+        "window_end_date": "",
         "decision_enter_symbols": [],
         "trade_enter_symbols_today": [],
         "deviations_today": [],
-        "counts": {"deviation_today": 0, "deviation_7d": 0},
+        "counts": {
+            "deviation_today": 0,
+            "deviation_7d": 0,
+            "unknown_symbol_days_7d": 0,
+            "unknown_symbol_events_7d": 0,
+            "no_trade_ignored_days_7d": 0,
+            "no_trade_ignored_streak": 0,
+        },
         "warning_level": "UNKNOWN",
-        "warning_reason": "decision missing or invalid",
+        "warning_reason": [],
     }
 
     decision_payload, decision_status = _safe_read_json(decision_path)
@@ -465,6 +583,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     deviation["trade_enter_symbols_today"] = trade_enter_symbols
 
     deviations_today: List[dict] = []
+    no_trade_ignored_added = False
     if decision_payload:
         if len(enter_symbols) == 0 and trade_enter_symbols:
             for sym in trade_enter_symbols:
@@ -476,6 +595,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "details": {"reason": "decision ENTER empty"},
                     }
                 )
+            deviations_today.append(
+                {
+                    "type": "no_trade_ignored",
+                    "symbol": "",
+                    "action_ts_jst": "",
+                    "details": {"source_type": "enter_when_no_trade", "symbols": trade_enter_symbols},
+                }
+            )
+            no_trade_ignored_added = True
         for sym in trade_enter_symbols:
             if sym not in enter_symbols and sym not in avoid_symbols:
                 deviations_today.append(
@@ -483,7 +611,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "type": "enter_not_in_enter_candidates",
                         "symbol": sym,
                         "action_ts_jst": "",
-                        "details": {"reason": "not in decision ENTER"},
+                        "details": {"reason": "not in decision ENTER", "unknown_symbol": True},
+                    }
+                )
+                deviations_today.append(
+                    {
+                        "type": "unknown_symbol_enter",
+                        "symbol": sym,
+                        "action_ts_jst": "",
+                        "details": {"source_type": "enter_not_in_enter_candidates"},
                     }
                 )
             if sym in avoid_symbols:
@@ -495,17 +631,99 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "details": {"reason": "decision AVOID"},
                     }
                 )
+        if not no_trade_ignored_added and trade_enter_symbols:
+            agent_verdict = summary.get("agent", {}).get("verdict")
+            if agent_verdict == "NO_TRADE" or len(enter_candidates) == 0:
+                deviations_today.append(
+                    {
+                        "type": "no_trade_ignored",
+                        "symbol": "",
+                        "action_ts_jst": "",
+                        "details": {"source_type": "agent_no_trade", "symbols": trade_enter_symbols},
+                    }
+                )
 
         deviation["decision_enter_symbols"] = enter_symbols
         deviation["deviations_today"] = deviations_today
         deviation["counts"]["deviation_today"] = len(deviations_today)
-        deviation["warning_level"] = "OK" if len(deviations_today) == 0 else "WARN"
-        deviation["warning_reason"] = "" if len(deviations_today) == 0 else "deviation_today > 0"
     else:
         deviation["decision_enter_symbols"] = []
         deviation["deviations_today"] = []
+        deviation["counts"]["deviation_today"] = 0
 
     alerts_path = out_dir / "alerts.jsonl"
+    window_dates = _window_dates(asof_date, args.window_days)
+    deviation["window_detail"] = {"window_days": args.window_days}
+    if window_dates:
+        deviation["window_start_date"] = window_dates[0]
+        deviation["window_end_date"] = window_dates[-1]
+
+    window_source = _read_deviation_days_from_alerts(alerts_path, window_dates) if window_dates else None
+    if window_source is None and window_dates:
+        window_source = _read_deviation_days_from_files(out_dir, window_dates)
+
+    warning_reasons: List[str] = []
+    if not window_dates or window_source is None:
+        deviation["warning_level"] = "UNKNOWN"
+        warning_reasons.append("window_source_missing")
+    else:
+        deviation_days = set(window_source.get("deviation_days", set()))
+        unknown_symbol_days = set(window_source.get("unknown_symbol_days", set()))
+        no_trade_ignored_days = set(window_source.get("no_trade_ignored_days", set()))
+
+        if len(deviations_today) > 0:
+            deviation_days.add(asof_date)
+        if any(d.get("type") == "unknown_symbol_enter" for d in deviations_today):
+            unknown_symbol_days.add(asof_date)
+        if any(d.get("type") == "no_trade_ignored" for d in deviations_today):
+            no_trade_ignored_days.add(asof_date)
+
+        deviation_7d = len(deviation_days)
+        unknown_symbol_days_7d = len(unknown_symbol_days)
+        no_trade_ignored_days_7d = len(no_trade_ignored_days)
+        no_trade_ignored_streak = _compute_streak(no_trade_ignored_days, window_dates)
+
+        deviation["counts"]["deviation_7d"] = deviation_7d
+        deviation["counts"]["unknown_symbol_days_7d"] = unknown_symbol_days_7d
+        deviation["counts"]["unknown_symbol_events_7d"] = int(window_source.get("unknown_symbol_events", 0))
+        deviation["counts"]["no_trade_ignored_days_7d"] = no_trade_ignored_days_7d
+        deviation["counts"]["no_trade_ignored_streak"] = no_trade_ignored_streak
+
+        level_order = {"OK": 0, "WARN": 1, "CRITICAL": 2}
+        warning_level = "OK"
+
+        if len(deviations_today) > 0:
+            warning_reasons.append("deviation_today>0")
+            warning_level = "WARN"
+
+        if deviation_7d >= 4:
+            warning_reasons.append("deviation_7d>=4")
+            warning_level = "CRITICAL"
+        elif deviation_7d >= 2:
+            warning_reasons.append("deviation_7d>=2")
+            if level_order[warning_level] < 1:
+                warning_level = "WARN"
+
+        if unknown_symbol_days_7d >= 4:
+            warning_reasons.append("unknown_symbol_days_7d>=4")
+            warning_level = "CRITICAL"
+        elif unknown_symbol_days_7d >= 2:
+            warning_reasons.append("unknown_symbol_days_7d>=2")
+            if level_order[warning_level] < 1:
+                warning_level = "WARN"
+
+        if no_trade_ignored_streak >= 3:
+            warning_reasons.append("no_trade_ignored_streak>=3")
+            warning_level = "CRITICAL"
+        elif no_trade_ignored_streak >= 2:
+            warning_reasons.append("no_trade_ignored_streak>=2")
+            if level_order[warning_level] < 1:
+                warning_level = "WARN"
+
+        deviation["warning_level"] = warning_level
+
+    deviation["warning_reason"] = warning_reasons
+
     existing_keys = _read_alerts(alerts_path)
     decision_hash = summary.get("decision_digest", {}).get("decision_hash", "")
     decision_id = summary.get("decision_digest", {}).get("decision_id", "")
@@ -559,7 +777,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         dedup_key=f"{asof_date}:RUN_SUMMARY",
     )
 
-    if deviations_today:
+    deviation_counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
+    deviation_types_today = sorted({d.get("type") for d in deviations_today if d.get("type")})
+    if deviation.get("warning_level") == "WARN":
         deviation_event_id = f"{asof_date}:{decision_id}:DEVIATION_WARN"
         _append_alert(
             alerts_path,
@@ -570,7 +790,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
                 "count": len(deviations_today),
                 "deviation_today_count": len(deviations_today),
-                "deviation_types": sorted({d.get("type") for d in deviations_today if d.get("type")}),
+                "deviation_7d": deviation_counts.get("deviation_7d", 0),
+                "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
+                "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
+                "deviation_types": deviation_types_today,
                 "result_detail": "logged_only",
                 "agent_verdict": agent.get("verdict"),
                 "agent_reason": agent.get("reason"),
@@ -579,6 +802,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             },
             existing_keys,
             dedup_key=f"{asof_date}:DEVIATION_WARN",
+        )
+    elif deviation.get("warning_level") == "CRITICAL":
+        deviation_event_id = f"{asof_date}:{decision_id}:DEVIATION_CRITICAL"
+        _append_alert(
+            alerts_path,
+            deviation_event_id,
+            "DEVIATION_CRITICAL",
+            {
+                "asof_date_utc": asof_date,
+                **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
+                "count": len(deviations_today),
+                "deviation_today_count": len(deviations_today),
+                "deviation_7d": deviation_counts.get("deviation_7d", 0),
+                "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
+                "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
+                "deviation_types": deviation_types_today,
+                "result_detail": "logged_only",
+                "agent_verdict": agent.get("verdict"),
+                "agent_reason": agent.get("reason"),
+                "agent_failed_checks": agent_failed_checks,
+                "agent_checks": agent_checks,
+            },
+            existing_keys,
+            dedup_key=f"{asof_date}:DEVIATION_CRITICAL",
         )
 
     enter_symbols_unique = sorted(set(enter_symbols))

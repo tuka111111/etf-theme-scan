@@ -152,8 +152,18 @@ def main() -> None:
         st.success("逸脱なし")
     elif warning_level == "WARN":
         st.warning("逸脱あり")
+    elif warning_level == "CRITICAL":
+        st.error("逸脱あり（CRITICAL）")
     else:
         st.info("逸脱判定: UNKNOWN")
+
+    warning_reason = deviation.get("warning_reason", [])
+    if isinstance(warning_reason, list):
+        reason_text = ", ".join([str(x) for x in warning_reason if str(x)])
+    else:
+        reason_text = str(warning_reason)
+    if reason_text:
+        st.write(f"warning_reason: {reason_text}")
 
     deviations = deviation.get("deviations_today", []) if isinstance(deviation.get("deviations_today", []), list) else []
     if deviations:

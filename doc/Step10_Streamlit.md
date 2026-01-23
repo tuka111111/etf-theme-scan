@@ -49,7 +49,7 @@ summary の no_trade.is_no_trade により分岐：
 	•	“今日見るのは ENTERだけ” を明記（WATCHは折りたたみ）
 
 C. 逸脱警告パネル（deviation）
-	•	warning_level が
+•	warning_level が
 	•	OK：緑の小パネル（逸脱なし）
 	•	WARN：黄色の警告（deviations_today件数、symbol一覧）
 	•	UNKNOWN：灰色（decision missing 等）
@@ -143,7 +143,8 @@ JSONが壊れている
 8) 最小実装の受け入れ基準（Done条件）
 	1.	summary_latest.json があれば ENTER が表で出る
 	2.	no_trade.is_no_trade=true のとき「今日は何もしない日です」が最上段に表示される
-	3.	deviation.warning_level=WARN なら警告が目立つ
+3.	deviation.warning_level=WARN なら警告が目立つ
+4.	warning_reason（array）を表示
 	4.	wideで横幅いっぱい、表が詰まらない
 	5.	ファイル欠損/破損でも画面が落ちない
 

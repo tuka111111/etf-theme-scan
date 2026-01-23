@@ -119,7 +119,7 @@ summary_*.json スキーマ（提案：step10_summary_v1）
 	•	deviation_latest.json
 
 deviation_*.json スキーマ（提案：step10_deviation_v1）
-	•	schema_version: "step10_deviation_v1"
+•	schema_version: "step10_deviation_v2"
 	•	generated_at_utc
 	•	asof_date_utc
 	•	window_days: int（例：7）
@@ -135,7 +135,7 @@ deviation_*.json スキーマ（提案：step10_deviation_v1）
 	•	deviation_today: int
 	•	deviation_7d: int
 	•	warning_level: "OK"|"WARN"|"CRITICAL"
-	•	warning_reason: string（例："deviation_7d >= 2"）
+•	warning_reason: array（例：["deviation_7d>=2"]）
 
 ⸻
 
@@ -360,7 +360,7 @@ warning_level
 7.2 deviation_latest.json / deviation_.json
 
 最低フィールド（固定）：
-	•	schema_version: "step10_deviation_v1"
+•	schema_version: "step10_deviation_v2"
 	•	generated_at_utc
 	•	asof_date_utc
 	•	decision_status
@@ -368,7 +368,7 @@ warning_level
 	•	trade_enter_symbols_today: list[str]
 	•	deviations_today: list[ {type, symbol, action_ts_jst?, decision_id?} ]
 	•	warning_level: "OK"|"WARN"|"UNKNOWN"
-	•	warning_reason
+•	warning_reason（array）
 
 7.3 alerts.jsonl（append-only）
 
