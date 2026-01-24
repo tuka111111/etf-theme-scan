@@ -1,0 +1,5 @@
+enabled: True
+max_items: 5
+channel: discord_webhook
+webhook_env: STEP10_DISCORD_WEBHOOK
+retry_failed: false

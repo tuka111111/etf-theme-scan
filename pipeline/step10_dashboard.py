@@ -124,10 +124,29 @@ def main() -> None:
     decision_hash = _short_hash(summary.get("decision_digest", {}).get("decision_hash", ""))
     decision_path = _short_path(summary.get("decision_path", ""))
 
+    agent = summary.get("agent", {}) if isinstance(summary.get("agent", {}), dict) else {}
+    agent_verdict = agent.get("verdict", "N/A")
+    agent_reason = agent.get("reason", "N/A")
+    failed_checks = agent.get("failed_checks", []) if isinstance(agent.get("failed_checks", []), list) else []
+
+    warning_level = deviation.get("warning_level", "UNKNOWN")
+    warning_reasons = deviation.get("warning_reasons", None)
+    if isinstance(warning_reasons, list):
+        warning_reason_text = "; ".join([str(x) for x in warning_reasons[:3] if str(x)])
+    else:
+        warning_reason_text = str(deviation.get("warning_reason", "") or "")
+    counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
+    deviation_7d = int(counts.get("deviation_7d", 0) or 0)
+    unknown_symbol_days_7d = int(counts.get("unknown_symbol_days_7d", 0) or 0)
+    no_trade_ignored_streak = int(counts.get("no_trade_ignored_streak", 0) or 0)
+
     header_cols = st.columns(3)
     header_cols[0].markdown(f"**asof_date_utc**: {asof_date}  \n**generated_at_utc**: {generated_at}")
-    header_cols[1].markdown(f"**risk_mode**: {risk_mode_label}")
-    header_cols[2].markdown(f"**decision_hash**: {decision_hash}  \n**decision_path**: {decision_path}")
+    header_cols[1].markdown(f"**risk_mode**: {risk_mode_label}  \n**agent**: {agent_verdict} ({agent_reason})")
+    header_cols[2].markdown(
+        f"**decision_hash**: {decision_hash}  \n**decision_path**: {decision_path}  "
+        f"\n**deviation**: {warning_level} ({warning_reason_text})"
+    )
 
     no_trade = summary.get("no_trade", {}) if isinstance(summary.get("no_trade", {}), dict) else {}
     is_no_trade = bool(no_trade.get("is_no_trade", True)) if summary else True
@@ -136,7 +155,18 @@ def main() -> None:
     watch_count = int(counts.get("watch", 0) or 0)
     avoid_count = int(counts.get("avoid", 0) or 0)
 
-    if is_no_trade:
+    if agent_verdict == "NO_TRADE":
+        st.markdown("## 今日は何もしない日です")
+        reason = no_trade.get("reason", "summary missing")
+        st.write(f"reason: {reason}")
+        st.write(f"agent_reason: {agent_reason}")
+        st.write(f"ENTER={enter_count} WATCH={watch_count} AVOID={avoid_count}")
+    elif agent_verdict == "ENTER_OK":
+        st.markdown(f"## ENTER候補: {enter_count}件")
+        tradable = summary.get("tradable_themes", [])
+        st.write("tradable_themes:", ", ".join(tradable) if tradable else "N/A")
+        st.write("今日見るのは ENTER だけ")
+    elif is_no_trade:
         st.markdown("## 今日は何もしない日です")
         reason = no_trade.get("reason", "summary missing")
         st.write(f"reason: {reason}")
@@ -147,23 +177,27 @@ def main() -> None:
         st.write("tradable_themes:", ", ".join(tradable) if tradable else "N/A")
         st.write("今日見るのは ENTER だけ")
 
-    warning_level = deviation.get("warning_level", "UNKNOWN")
     if warning_level == "OK":
-        st.success("逸脱なし")
+        st.success("逸脱: OK")
     elif warning_level == "WARN":
-        st.warning("逸脱あり")
+        st.warning("逸脱: WARN")
+        st.write(
+            f"window: deviation_7d={deviation_7d}, "
+            f"unknown_symbol_days_7d={unknown_symbol_days_7d}, "
+            f"no_trade_ignored_streak={no_trade_ignored_streak}"
+        )
     elif warning_level == "CRITICAL":
-        st.error("逸脱あり（CRITICAL）")
+        st.error("逸脱: CRITICAL")
+        st.write(
+            f"window: deviation_7d={deviation_7d}, "
+            f"unknown_symbol_days_7d={unknown_symbol_days_7d}, "
+            f"no_trade_ignored_streak={no_trade_ignored_streak}"
+        )
     else:
-        st.info("逸脱判定: UNKNOWN")
+        st.info("逸脱: UNKNOWN")
 
-    warning_reason = deviation.get("warning_reason", [])
-    if isinstance(warning_reason, list):
-        reason_text = ", ".join([str(x) for x in warning_reason if str(x)])
-    else:
-        reason_text = str(warning_reason)
-    if reason_text:
-        st.write(f"warning_reason: {reason_text}")
+    if warning_reason_text:
+        st.write(f"warning_reason: {warning_reason_text}")
 
     deviations = deviation.get("deviations_today", []) if isinstance(deviation.get("deviations_today", []), list) else []
     if deviations:
@@ -194,15 +228,15 @@ def main() -> None:
 
     with st.expander("WATCH / AVOID (counts)"):
         st.write(f"WATCH={watch_count} AVOID={avoid_count}")
-        st.write(f"decision_latest.json: {summary.get('decision_path','N/A')}")
+        st.write(f"decision_latest.json: {_short_path(summary.get('decision_path','N/A'))}")
         st.write("詳細は out/step6_decision/decision_latest.json を参照")
 
     with st.expander("Debug / Inputs"):
-        st.write(f"decision_path: {summary.get('decision_path','')}")
-        st.write(f"trades_dir: {summary.get('trades_dir','')}")
+        st.write(f"decision_path: {_short_path(summary.get('decision_path',''))}")
+        st.write(f"trades_dir: {_short_path(summary.get('trades_dir',''))}")
         st.write(f"decision_status: {summary.get('decision_status','')}")
-        st.write(f"summary_path: {summary_path}")
-        st.write(f"deviation_path: {deviation_path}")
+        st.write(f"summary_path: {_short_path(str(summary_path))}")
+        st.write(f"deviation_path: {_short_path(str(deviation_path))}")
         if summary_err:
             st.write(f"summary_error: {summary_err}")
         if deviation_err:
