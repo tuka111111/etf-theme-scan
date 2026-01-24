@@ -259,6 +259,81 @@ def _read_step10_alerts_config(config_path: Path) -> dict:
         return defaults
 
 
+def _read_rules_yaml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data: dict[str, object] = {}
+        current_section = ""
+        current_subsection = ""
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("flags:"):
+                current_section = "flags"
+                current_subsection = ""
+                data.setdefault("flags", {})
+                continue
+            if line.startswith("env_bias:"):
+                current_section = "env_bias"
+                current_subsection = ""
+                data.setdefault("env_bias", {})
+                continue
+            if line.startswith("-") and current_section == "flags":
+                item = line.lstrip("-").strip()
+                if item:
+                    data.setdefault("flags", {}).setdefault("ignore", [])
+                    data["flags"]["ignore"].append(item)
+                continue
+            if line.endswith(":") and current_section == "env_bias":
+                current_subsection = line[:-1].strip()
+                data.setdefault("env_bias", {}).setdefault(current_subsection, {})
+                continue
+            if ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip()
+                value = value.strip()
+                if current_section == "flags" and key == "ignore":
+                    if value.startswith("[") and value.endswith("]"):
+                        inner = value[1:-1].strip()
+                        items = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+                        data.setdefault("flags", {})["ignore"] = items
+                elif current_section == "env_bias" and current_subsection:
+                    if key == "action":
+                        data.setdefault("env_bias", {}).setdefault(current_subsection, {})["action"] = value
+        return data
+    except Exception:
+        return {}
+
+
+def _normalize_rules_for_agent(raw_rules: object) -> dict:
+    rules: dict[str, object] = {}
+    if isinstance(raw_rules, dict):
+        rules.update(raw_rules)
+    flags_ignore: List[str] = []
+    flags = rules.get("flags", {})
+    if isinstance(flags, dict):
+        ignore = flags.get("ignore", [])
+        if isinstance(ignore, list):
+            flags_ignore = [str(x) for x in ignore if str(x)]
+        elif isinstance(ignore, str):
+            flags_ignore = [ignore]
+    if not flags_ignore:
+        flags_ignore = ["data_quality_low", "halted", "bad_symbol"]
+    rules["flags"] = {"ignore": flags_ignore}
+
+    env_bias = rules.get("env_bias", {})
+    normalized_env = {"bull": {"action": "allow"}, "neutral": {"action": "allow"}, "bear": {"action": "allow"}}
+    if isinstance(env_bias, dict):
+        for key in ["bull", "neutral", "bear"]:
+            if isinstance(env_bias.get(key), dict):
+                action = str(env_bias.get(key, {}).get("action", "allow"))
+                normalized_env[key] = {"action": action}
+    rules["env_bias"] = normalized_env
+    return rules
+
+
 def _window_dates(asof_date_utc: str, window_days: int) -> List[str]:
     try:
         base = datetime.fromisoformat(asof_date_utc).date()
@@ -274,9 +349,6 @@ def _read_deviation_days_from_alerts(alerts_path: Path, window_dates: List[str])
     if not alerts_path.exists():
         return None
     deviation_days: set[str] = set()
-    unknown_symbol_days: set[str] = set()
-    no_trade_ignored_days: set[str] = set()
-    any_alert_days: set[str] = set()
     invalid_lines = 0
     try:
         with alerts_path.open(encoding="utf-8") as f:
@@ -292,26 +364,13 @@ def _read_deviation_days_from_alerts(alerts_path: Path, window_dates: List[str])
                 kind = record.get("kind", "")
                 payload = record.get("payload", {}) if isinstance(record.get("payload", {}), dict) else {}
                 asof = payload.get("asof_date_utc") or record.get("asof_date_utc")
-                if asof:
-                    any_alert_days.add(asof)
                 if kind not in {"DEVIATION_WARN", "DEVIATION_CRITICAL", "DEVIATION_EVENT"}:
                     continue
                 if asof not in window_dates:
                     continue
                 deviation_days.add(asof)
-                deviation_types = payload.get("deviation_types", [])
-                if isinstance(deviation_types, list):
-                    if "enter_not_in_enter_candidates" in deviation_types or "unknown_symbol_enter" in deviation_types:
-                        unknown_symbol_days.add(asof)
-                    if "no_trade_ignored" in deviation_types:
-                        no_trade_ignored_days.add(asof)
         return {
             "deviation_days": deviation_days,
-            "unknown_symbol_days": unknown_symbol_days,
-            "no_trade_ignored_days": no_trade_ignored_days,
-            "unknown_symbol_events": 0,
-            "no_trade_ignored_events": 0,
-            "missing_alert_days": len([d for d in window_dates if d not in any_alert_days]),
             "invalid_alert_lines": invalid_lines,
             "source": "alerts",
         }
@@ -455,14 +514,15 @@ def post_discord(webhook_url: str, content: str) -> tuple[bool, Optional[int], O
         return False, None, str(e)
 
 
-def build_agent_verdict(summary: dict) -> dict:
+def build_agent_verdict(summary: dict, rules_used: dict, rules_source: str) -> dict:
     enter_candidates = summary.get("enter_candidates", []) if isinstance(summary.get("enter_candidates", []), list) else []
     enter_count = len(enter_candidates)
     risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
     risk_mode_value = str(risk_mode.get("mode", "")).upper()
+    rules_flags = rules_used.get("flags", {}) if isinstance(rules_used.get("flags", {}), dict) else {}
+    ignore_flags = rules_flags.get("ignore", []) if isinstance(rules_flags.get("ignore", []), list) else []
 
-    blocking_flags = {"data_quality_low", "halted", "bad_symbol"}
-    found_blocking: List[str] = []
+    blocked_candidates: List[dict] = []
     for row in enter_candidates:
         flags = row.get("flags", [])
         if isinstance(flags, list):
@@ -471,36 +531,59 @@ def build_agent_verdict(summary: dict) -> dict:
             items = [flags]
         else:
             items = []
-        for flag in items:
-            if flag in blocking_flags:
-                found_blocking.append(flag)
+        blocked = [flag for flag in items if flag in ignore_flags]
+        if blocked and len(blocked_candidates) < 3:
+            blocked_candidates.append({"symbol": row.get("symbol", ""), "flags": blocked})
 
     enter_exists_ok = enter_count > 0
-    no_blocking_ok = len(found_blocking) == 0
+    no_ignored_ok = len(blocked_candidates) == 0
     risk_mode_ok = risk_mode_value != "RISK_OFF"
+
+    current_env = "neutral"
+    if risk_mode_value == "RISK_ON":
+        current_env = "bull"
+    elif risk_mode_value == "RISK_OFF":
+        current_env = "bear"
+    env_bias = rules_used.get("env_bias", {}) if isinstance(rules_used.get("env_bias", {}), dict) else {}
+    env_action = (
+        env_bias.get(current_env, {}).get("action", "allow")
+        if isinstance(env_bias.get(current_env, {}), dict)
+        else "allow"
+    )
+    env_bias_ok = str(env_action) != "skip"
 
     checks = [
         {"id": "enter_exists", "ok": enter_exists_ok, "detail": f"enter_count={enter_count}"},
-        {
-            "id": "no_blocking_flags",
-            "ok": no_blocking_ok,
-            "detail": "no blocking flags" if no_blocking_ok else "blocking flag present",
-        },
         {"id": "risk_mode_allows", "ok": risk_mode_ok, "detail": f"risk_mode={risk_mode_value or 'unknown'}"},
+        {
+            "id": "no_ignored_flags_present",
+            "ok": no_ignored_ok,
+            "detail": "no ignored flags" if no_ignored_ok else f"blocked={blocked_candidates}",
+        },
+        {
+            "id": "env_bias_allows",
+            "ok": env_bias_ok,
+            "detail": f"env={current_env} action={env_action}",
+        },
     ]
 
     failed_checks = [c["id"] for c in checks if not c["ok"]]
 
     if not enter_exists_ok:
         reason = "ENTER candidates = 0"
-    elif not no_blocking_ok:
-        reason = "blocking flag present"
+    elif not no_ignored_ok:
+        reason = "ignored flag present"
     elif not risk_mode_ok:
         reason = "risk_mode disallows"
+    elif not env_bias_ok:
+        reason = "env_bias disallows"
     else:
         reason = "checks passed"
 
-    verdict = "ENTER_OK" if (enter_exists_ok and no_blocking_ok and risk_mode_ok) else "NO_TRADE"
+    verdict = "ENTER_OK" if (enter_exists_ok and no_ignored_ok and risk_mode_ok and env_bias_ok) else "NO_TRADE"
+    rules_digest = hashlib.sha1(
+        json.dumps(rules_used, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:12]
 
     return {
         "schema_version": "agent_v1",
@@ -510,6 +593,9 @@ def build_agent_verdict(summary: dict) -> dict:
         "failed_checks": failed_checks,
         "computed_at_utc": _now_utc_iso(),
         "source": "step10_agent_rules_v1",
+        "rules_source": rules_source,
+        "rules_digest": rules_digest,
+        "blocked_candidates": blocked_candidates,
     }
 
 
@@ -598,6 +684,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "unknown_symbol_events_7d": 0,
             "no_trade_ignored_days_7d": 0,
             "no_trade_ignored_streak": 0,
+            "no_trade_ignored_events_7d": 0,
             "missing_alert_days_7d": 0,
             "invalid_alert_lines_7d": 0,
         },
@@ -652,7 +739,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "decision_id": decision_id,
         "enter_symbols": enter_symbols,
     }
-    summary["agent"] = build_agent_verdict(summary)
+    rules_used = {}
+    rules_source = "defaults"
+    if decision_payload and isinstance(decision_payload.get("rules"), dict):
+        rules_used = _normalize_rules_for_agent(decision_payload.get("rules"))
+        rules_source = "decision.rules"
+    else:
+        rules_path = ROOT / "config" / "rules.yaml"
+        if rules_path.exists():
+            rules_used = _normalize_rules_for_agent(_read_rules_yaml(rules_path))
+            rules_source = "config.rules.yaml"
+        else:
+            rules_used = _normalize_rules_for_agent({})
+            rules_source = "defaults"
+
+    summary["agent"] = build_agent_verdict(summary, rules_used, rules_source)
 
     today_trades = _read_trades(trades_dir, asof_date)
     trade_enter_symbols = sorted(
@@ -737,7 +838,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     deviation["no_trade_ignored_today"] = bool(no_trade_ignored_today)
 
     window_dates = _window_dates(asof_date, args.window_days)
-    deviation["window_detail"] = {"window_days": args.window_days, "source": "deviation_files"}
+    deviation["window_detail"] = {
+        "window_days": args.window_days,
+        "source": "deviation_files",
+        "observed_days": 0,
+        "files_read_days": [],
+        "alerts_fallback_days": [],
+        "missing_days": [],
+        "unknown_symbol_top": [],
+    }
     if window_dates:
         deviation["window_start_date"] = window_dates[0]
         deviation["window_end_date"] = window_dates[-1]
@@ -750,12 +859,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hit_days: set[str] = set()
         unknown_symbol_days: set[str] = set()
         no_trade_ignored_days: set[str] = set()
-        read_any = False
+        unknown_symbol_events = 0
+        no_trade_ignored_events = 0
+        symbol_counts: Dict[str, int] = {}
+        files_read_days: List[str] = []
+        missing_days: List[str] = []
         for day in window_dates:
             payload = _load_deviation_for_date(out_dir, day)
             if not payload:
+                missing_days.append(day)
                 continue
-            read_any = True
+            files_read_days.append(day)
             if payload.get("deviation_day_hit_today") is True:
                 hit_days.add(day)
             else:
@@ -766,14 +880,58 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 unknown_symbol_days.add(day)
             else:
                 deviations = payload.get("deviations_today", [])
-                if isinstance(deviations, list) and any(d.get("type") == "enter_not_in_enter_candidates" for d in deviations):
-                    unknown_symbol_days.add(day)
+                if isinstance(deviations, list):
+                    for d in deviations:
+                        if d.get("type") == "enter_not_in_enter_candidates" or d.get("details", {}).get("unknown_symbol") is True:
+                            unknown_symbol_days.add(day)
+                            sym = str(d.get("symbol", "")).upper()
+                            if sym:
+                                symbol_counts[sym] = symbol_counts.get(sym, 0) + 1
+                            unknown_symbol_events += 1
             if payload.get("no_trade_ignored_today") is True:
                 no_trade_ignored_days.add(day)
+            else:
+                deviations = payload.get("deviations_today", [])
+                if isinstance(deviations, list):
+                    for d in deviations:
+                        if d.get("type") in {"no_trade_ignored", "enter_when_no_trade"}:
+                            no_trade_ignored_days.add(day)
+                            no_trade_ignored_events += 1
 
-        if not read_any:
+        alerts_fallback_days: List[str] = []
+        invalid_alert_lines = 0
+        if missing_days:
+            alerts_source = _read_deviation_days_from_alerts(out_dir / "alerts.jsonl", window_dates)
+            if alerts_source:
+                invalid_alert_lines = int(alerts_source.get("invalid_alert_lines", 0))
+                for day in list(missing_days):
+                    if day in alerts_source.get("deviation_days", set()):
+                        alerts_fallback_days.append(day)
+                        hit_days.add(day)
+                        missing_days.remove(day)
+
+        observed_days = len(files_read_days) + len(alerts_fallback_days)
+        deviation["window_detail"]["observed_days"] = observed_days
+        deviation["window_detail"]["files_read_days"] = files_read_days
+        deviation["window_detail"]["alerts_fallback_days"] = alerts_fallback_days
+        deviation["window_detail"]["missing_days"] = missing_days
+        deviation["window_detail"]["source_breakdown"] = {
+            "files": len(files_read_days),
+            "alerts": len(alerts_fallback_days),
+            "missing": len(missing_days),
+        }
+
+        top_symbols = sorted(symbol_counts.items(), key=lambda x: (-x[1], x[0]))[:3]
+        deviation["window_detail"]["unknown_symbol_top"] = [
+            {"symbol": sym, "count": cnt} for sym, cnt in top_symbols
+        ]
+
+        deviation["counts"]["missing_alert_days_7d"] = len(missing_days)
+        deviation["counts"]["invalid_alert_lines_7d"] = invalid_alert_lines
+
+        if observed_days < 4:
             deviation["warning_level"] = "UNKNOWN"
-            warning_reasons.append("window_source_empty")
+            warning_reasons.append("observed_days<4")
         else:
             deviation_7d = len(hit_days)
             unknown_symbol_days_7d = len(unknown_symbol_days)
@@ -784,6 +942,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             deviation["counts"]["unknown_symbol_days_7d"] = unknown_symbol_days_7d
             deviation["counts"]["no_trade_ignored_days_7d"] = no_trade_ignored_days_7d
             deviation["counts"]["no_trade_ignored_streak"] = no_trade_ignored_streak
+            deviation["counts"]["unknown_symbol_events_7d"] = unknown_symbol_events
+            deviation["counts"]["no_trade_ignored_events_7d"] = no_trade_ignored_events
 
             warning_level = "OK"
             if deviation_7d >= 4:
@@ -855,6 +1015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_reason": agent.get("reason"),
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
+            "agent_rules_digest": agent.get("rules_digest"),
         },
         existing_keys,
         dedup_key=f"{asof_date}:RUN_SUMMARY",
@@ -863,58 +1024,130 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     deviation_counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
     deviation_types_today = sorted({d.get("type") for d in deviations_today if d.get("type")})
     warning_reasons = deviation.get("warning_reasons", []) if isinstance(deviation.get("warning_reasons", []), list) else []
+    observed_days = deviation.get("window_detail", {}).get("observed_days", 0)
+    unknown_symbol_top = deviation.get("window_detail", {}).get("unknown_symbol_top", [])
     if deviation.get("warning_level") == "WARN":
         deviation_event_id = f"{asof_date}:{decision_id}:DEVIATION_WARN"
-        _append_alert(
-            alerts_path,
-            deviation_event_id,
-            "DEVIATION_WARN",
-            {
-                "asof_date_utc": asof_date,
-                **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
-                "count": len(deviations_today),
-                "deviation_today_count": len(deviations_today),
-                "deviation_7d": deviation_counts.get("deviation_7d", 0),
-                "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
-                "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
-                "warning_reasons": warning_reasons,
-                "warning_level": "WARN",
-                "deviation_types": deviation_types_today,
-                "result_detail": "logged_only",
-                "agent_verdict": agent.get("verdict"),
-                "agent_reason": agent.get("reason"),
-                "agent_failed_checks": agent_failed_checks,
-                "agent_checks": agent_checks,
-            },
-            existing_keys,
-            dedup_key=f"{asof_date}:DEVIATION_WARN",
+        message_preview = (
+            f"[WARN] deviation_days_7d={deviation_counts.get('deviation_7d', 0)} "
+            f"observed_days={observed_days} "
+            f"no_trade_ignored_streak={deviation_counts.get('no_trade_ignored_streak', 0)} "
+            f"unknown_symbol_days_7d={deviation_counts.get('unknown_symbol_days_7d', 0)}"
         )
+        send_result = "logged_only"
+        send_error = None
+        send_status = None
+        if deviation_event_id in existing_keys:
+            send_result = "skipped_duplicate"
+        elif send_enabled and webhook_url:
+            ok, status, err = post_discord(webhook_url, message_preview)
+            send_status = status
+            if ok:
+                send_result = "sent"
+            else:
+                send_result = "failed"
+                send_error = f"{err or 'send_failed'}"
+        elif send_enabled and not webhook_url:
+            send_result = "logged_only"
+            send_error = "webhook not configured (.env missing)"
+        else:
+            send_error = send_gate_reason or "send disabled"
+        payload = {
+            "asof_date_utc": asof_date,
+            **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
+            "count": len(deviations_today),
+            "deviation_today_count": len(deviations_today),
+            "deviation_7d": deviation_counts.get("deviation_7d", 0),
+            "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
+            "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
+            "observed_days": observed_days,
+            "unknown_symbol_top": unknown_symbol_top,
+            "warning_reasons": warning_reasons,
+            "warning_level": "WARN",
+            "deviation_types": deviation_types_today,
+            "message_preview": message_preview,
+            "result": send_result,
+            "send_result": send_result,
+            "agent_verdict": agent.get("verdict"),
+            "agent_reason": agent.get("reason"),
+            "agent_failed_checks": agent_failed_checks,
+            "agent_checks": agent_checks,
+            "agent_rules_digest": agent.get("rules_digest"),
+        }
+        if send_error:
+            payload["reason"] = send_error
+        if send_status is not None:
+            payload["http_status"] = send_status
+        if send_result != "skipped_duplicate":
+            _append_alert(
+                alerts_path,
+                deviation_event_id,
+                "DEVIATION_WARN",
+                payload,
+                existing_keys,
+                dedup_key=f"{asof_date}:DEVIATION_WARN",
+            )
     elif deviation.get("warning_level") == "CRITICAL":
         deviation_event_id = f"{asof_date}:{decision_id}:DEVIATION_CRITICAL"
-        _append_alert(
-            alerts_path,
-            deviation_event_id,
-            "DEVIATION_CRITICAL",
-            {
-                "asof_date_utc": asof_date,
-                **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
-                "count": len(deviations_today),
-                "deviation_today_count": len(deviations_today),
-                "deviation_7d": deviation_counts.get("deviation_7d", 0),
-                "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
-                "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
-                "warning_reasons": warning_reasons,
-                "warning_level": "CRITICAL",
-                "deviation_types": deviation_types_today,
-                "result_detail": "logged_only",
-                "agent_verdict": agent.get("verdict"),
-                "agent_reason": agent.get("reason"),
-                "agent_failed_checks": agent_failed_checks,
-                "agent_checks": agent_checks,
-            },
-            existing_keys,
-            dedup_key=f"{asof_date}:DEVIATION_CRITICAL",
+        message_preview = (
+            f"[CRITICAL] deviation_days_7d={deviation_counts.get('deviation_7d', 0)} "
+            f"observed_days={observed_days} "
+            f"no_trade_ignored_streak={deviation_counts.get('no_trade_ignored_streak', 0)} "
+            f"unknown_symbol_days_7d={deviation_counts.get('unknown_symbol_days_7d', 0)} -> STOP/REVIEW"
         )
+        send_result = "logged_only"
+        send_error = None
+        send_status = None
+        if deviation_event_id in existing_keys:
+            send_result = "skipped_duplicate"
+        elif send_enabled and webhook_url:
+            ok, status, err = post_discord(webhook_url, message_preview)
+            send_status = status
+            if ok:
+                send_result = "sent"
+            else:
+                send_result = "failed"
+                send_error = f"{err or 'send_failed'}"
+        elif send_enabled and not webhook_url:
+            send_result = "logged_only"
+            send_error = "webhook not configured (.env missing)"
+        else:
+            send_error = send_gate_reason or "send disabled"
+        payload = {
+            "asof_date_utc": asof_date,
+            **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
+            "count": len(deviations_today),
+            "deviation_today_count": len(deviations_today),
+            "deviation_7d": deviation_counts.get("deviation_7d", 0),
+            "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
+            "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
+            "observed_days": observed_days,
+            "unknown_symbol_top": unknown_symbol_top,
+            "warning_reasons": warning_reasons,
+            "warning_level": "CRITICAL",
+            "deviation_types": deviation_types_today,
+            "message_preview": message_preview,
+            "result": send_result,
+            "send_result": send_result,
+            "agent_verdict": agent.get("verdict"),
+            "agent_reason": agent.get("reason"),
+            "agent_failed_checks": agent_failed_checks,
+            "agent_checks": agent_checks,
+            "agent_rules_digest": agent.get("rules_digest"),
+        }
+        if send_error:
+            payload["reason"] = send_error
+        if send_status is not None:
+            payload["http_status"] = send_status
+        if send_result != "skipped_duplicate":
+            _append_alert(
+                alerts_path,
+                deviation_event_id,
+                "DEVIATION_CRITICAL",
+                payload,
+                existing_keys,
+                dedup_key=f"{asof_date}:DEVIATION_CRITICAL",
+            )
 
     enter_symbols_unique = sorted(set(enter_symbols))
 
@@ -963,6 +1196,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_reason": agent.get("reason"),
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
+            "agent_rules_digest": agent.get("rules_digest"),
         }
         if send_error:
             payload["reason"] = send_error
@@ -1010,6 +1244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_reason": agent.get("reason"),
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
+            "agent_rules_digest": agent.get("rules_digest"),
         }
         if send_error:
             payload["reason"] = send_error

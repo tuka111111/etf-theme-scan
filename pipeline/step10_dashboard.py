@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -25,6 +26,8 @@ def _load_json(path: Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
 
 def _short_path(path: str, max_len: int = 48) -> str:
     if not path:
+        return "N/A"
+    if "/Users/" in path:
         return "N/A"
     if len(path) <= max_len:
         return path
@@ -78,6 +81,40 @@ def _threshold_value(threshold_used: str) -> Optional[float]:
         return None
 
 
+def _sanitize_text(value: object) -> str:
+    text = str(value) if value is not None else ""
+    if "/Users/" in text:
+        return ""
+    return text
+
+
+def _safe_rel_display(path_str: object) -> str:
+    if not isinstance(path_str, str) or not path_str:
+        return "N/A"
+    if path_str.startswith("/"):
+        return "N/A"
+    if "/Users/" in path_str:
+        return "N/A"
+    return path_str
+
+
+def _safe_tail_jsonl(path: Path, n: int) -> Tuple[list[dict], int]:
+    if not path.exists():
+        return [], 0
+    items: deque = deque(maxlen=max(n, 1))
+    invalid = 0
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except Exception:
+                invalid += 1
+    return list(items), invalid
+
+
 def main() -> None:
     st.set_page_config(layout="wide", page_title="Step10 Daily", initial_sidebar_state="collapsed")
 
@@ -85,6 +122,7 @@ def main() -> None:
     ap.add_argument("--out", default="out")
     ap.add_argument("--date", default="latest")
     ap.add_argument("--latest", action="store_true")
+    ap.add_argument("--alerts-tail", type=int, default=200)
     args = ap.parse_args()
 
     out_root = Path(args.out)
@@ -124,6 +162,9 @@ def main() -> None:
     decision_hash = _short_hash(summary.get("decision_digest", {}).get("decision_hash", ""))
     decision_path = _short_path(summary.get("decision_path", ""))
 
+    alerts_path = daily_dir / "alerts.jsonl"
+    watchlist_latest = daily_dir / "watchlist_enter_latest.txt"
+
     agent = summary.get("agent", {}) if isinstance(summary.get("agent", {}), dict) else {}
     agent_verdict = agent.get("verdict", "N/A")
     agent_reason = agent.get("reason", "N/A")
@@ -148,6 +189,22 @@ def main() -> None:
         f"\n**deviation**: {warning_level} ({warning_reason_text})"
     )
 
+    st.markdown("### Today")
+    st.write(f"asof_date_utc: {asof_date} / generated_at_utc: {generated_at}")
+    st.write(f"risk_mode: {risk_mode_label}")
+    decision_id = summary.get("decision_digest", {}).get("decision_id", "N/A")
+    st.write(f"decision_id: {decision_id}")
+    st.markdown(f"**agent verdict**: {agent_verdict}")
+    st.write(f"agent reason: {agent_reason}")
+    if failed_checks:
+        st.write("failed_checks:")
+        for c in failed_checks:
+            st.write(f"- {c}")
+    rules_source = agent.get("rules_source")
+    rules_digest = agent.get("rules_digest")
+    if rules_source or rules_digest:
+        st.caption(f"rules_source={rules_source or 'N/A'} / rules_digest={rules_digest or 'N/A'}")
+
     no_trade = summary.get("no_trade", {}) if isinstance(summary.get("no_trade", {}), dict) else {}
     is_no_trade = bool(no_trade.get("is_no_trade", True)) if summary else True
     counts = summary.get("counts", {}) if isinstance(summary.get("counts", {}), dict) else {}
@@ -157,6 +214,7 @@ def main() -> None:
 
     if agent_verdict == "NO_TRADE":
         st.markdown("## 今日は何もしない日です")
+        st.error("今日は何もしない日です")
         reason = no_trade.get("reason", "summary missing")
         st.write(f"reason: {reason}")
         st.write(f"agent_reason: {agent_reason}")
@@ -168,6 +226,7 @@ def main() -> None:
         st.write("今日見るのは ENTER だけ")
     elif is_no_trade:
         st.markdown("## 今日は何もしない日です")
+        st.warning("今日は何もしない日です")
         reason = no_trade.get("reason", "summary missing")
         st.write(f"reason: {reason}")
         st.write(f"ENTER={enter_count} WATCH={watch_count} AVOID={avoid_count}")
@@ -194,53 +253,108 @@ def main() -> None:
             f"no_trade_ignored_streak={no_trade_ignored_streak}"
         )
     else:
-        st.info("逸脱: UNKNOWN")
+        st.warning("逸脱: UNKNOWN")
 
     if warning_reason_text:
         st.write(f"warning_reason: {warning_reason_text}")
 
     deviations = deviation.get("deviations_today", []) if isinstance(deviation.get("deviations_today", []), list) else []
     if deviations:
-        dev_df = pd.DataFrame(deviations)
-        cols = [c for c in ["type", "symbol", "action_ts_jst", "decision_id"] if c in dev_df.columns]
-        st.dataframe(dev_df[cols], use_container_width=True, hide_index=True)
+        dev_rows = []
+        for d in deviations:
+            details = d.get("details", {}) if isinstance(d.get("details", {}), dict) else {}
+            dev_rows.append(
+                {"type": d.get("type", ""), "symbol": d.get("symbol", ""), "reason": details.get("reason", "")}
+            )
+        dev_df = pd.DataFrame(dev_rows)
+        st.dataframe(dev_df, use_container_width=True, hide_index=True)
     else:
         st.write("逸脱: なし")
 
+    with st.expander("Deviation context"):
+        st.write("trade_enter_symbols_today:", deviation.get("trade_enter_symbols_today", []))
+        st.write("decision_enter_symbols:", deviation.get("decision_enter_symbols", []))
+
     st.markdown("## ENTER Candidates")
     enter_rows = summary.get("enter_candidates", []) if isinstance(summary.get("enter_candidates", []), list) else []
-    enter_df = _enter_table(enter_rows)
-    if enter_df.empty:
+    if enter_count <= 0:
         st.write("ENTER候補: なし")
     else:
-        def _row_style(row: pd.Series) -> list[str]:
-            threshold = _threshold_value(str(row.get("threshold_used", "")))
-            try:
-                score_adj = float(row.get("score_adjusted"))
-            except Exception:
-                score_adj = None
-            if threshold is not None and score_adj is not None and score_adj < threshold:
-                return ["background-color: #fff4e5"] * len(row)
-            return [""] * len(row)
+        enter_df = _enter_table(enter_rows).head(5)
+        if not enter_df.empty:
+            enter_df.insert(0, "rank", range(1, len(enter_df) + 1))
+            enter_df["flags"] = enter_df["flags"].apply(lambda v: v if v else "clean")
 
-        styled = enter_df.style.apply(_row_style, axis=1)
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+            def _row_style(row: pd.Series) -> pd.Series:
+                threshold = _threshold_value(str(row.get("threshold_used", "")))
+                try:
+                    score_adj = float(row.get("score_adjusted"))
+                except Exception:
+                    score_adj = None
+                styles = [""] * len(row)
+                if threshold is not None and score_adj is not None and score_adj < threshold:
+                    for col in row.index:
+                        if col in {"symbol", "score_total", "score_adjusted", "threshold_used"}:
+                            styles[row.index.get_loc(col)] = "background-color: #fff4e5"
+                return pd.Series(styles, index=row.index)
+
+            styled = enter_df.style.apply(_row_style, axis=1)
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.write(f"watchlist: {_safe_rel_display(summary.get('watchlist_path',''))}")
+    watchlist_latest = daily_dir / "watchlist_enter_latest.txt"
+    if watchlist_latest.exists():
+        with st.expander("watchlist_enter_latest.txt"):
+            st.code(_sanitize_text(watchlist_latest.read_text(encoding="utf-8")))
 
     with st.expander("WATCH / AVOID (counts)"):
         st.write(f"WATCH={watch_count} AVOID={avoid_count}")
-        st.write(f"decision_latest.json: {_short_path(summary.get('decision_path','N/A'))}")
+        st.write(f"decision_latest.json: {_safe_rel_display(summary.get('decision_path','N/A'))}")
         st.write("詳細は out/step6_decision/decision_latest.json を参照")
 
     with st.expander("Debug / Inputs"):
-        st.write(f"decision_path: {_short_path(summary.get('decision_path',''))}")
-        st.write(f"trades_dir: {_short_path(summary.get('trades_dir',''))}")
+        st.write(f"decision_path: {_safe_rel_display(summary.get('decision_path',''))}")
+        st.write(f"trades_dir: {_safe_rel_display(summary.get('trades_dir',''))}")
         st.write(f"decision_status: {summary.get('decision_status','')}")
-        st.write(f"summary_path: {_short_path(str(summary_path))}")
-        st.write(f"deviation_path: {_short_path(str(deviation_path))}")
+        st.write(f"summary_path: {_safe_rel_display(str(summary_path))}")
+        st.write(f"deviation_path: {_safe_rel_display(str(deviation_path))}")
         if summary_err:
             st.write(f"summary_error: {summary_err}")
         if deviation_err:
             st.write(f"deviation_error: {deviation_err}")
+
+    st.markdown("## Alerts (tail)")
+    alerts_path = daily_dir / "alerts.jsonl"
+    alert_rows, invalid_count = _safe_tail_jsonl(alerts_path, args.alerts_tail)
+    if invalid_count:
+        st.write(f"invalid_lines: {invalid_count}")
+    kinds = sorted({str(a.get("kind", "")) for a in alert_rows if a.get("kind")})
+    kind_filter = st.selectbox("kind filter", ["ALL"] + kinds, index=0)
+    table_rows = []
+    for rec in alert_rows:
+        kind = rec.get("kind", "")
+        if kind_filter != "ALL" and kind != kind_filter:
+            continue
+        payload = rec.get("payload", {}) if isinstance(rec.get("payload", {}), dict) else {}
+        event_id = rec.get("event_id") or payload.get("event_id") or rec.get("dedup_key") or ""
+        send_result = payload.get("send_result") or payload.get("result") or ""
+        table_rows.append(
+            {
+                "ts_utc": _sanitize_text(rec.get("ts_utc", "")),
+                "kind": _sanitize_text(kind),
+                "event_id": _sanitize_text(event_id),
+                "send_result": _sanitize_text(send_result),
+                "http_status": _sanitize_text(payload.get("http_status", "")),
+                "reason": _sanitize_text(payload.get("reason", "")),
+                "decision_id": _sanitize_text(payload.get("decision_id", "")),
+            }
+        )
+    if table_rows:
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+    else:
+        st.write("alerts: none")
+    with st.expander("alerts payload (tail)"):
+        masked = [_sanitize_text(json.dumps(r, ensure_ascii=False)) for r in alert_rows]
+        st.code("\n".join(masked))
 
 
 if __name__ == "__main__":
