@@ -266,6 +266,7 @@ def _read_rules_yaml(path: Path) -> dict:
         data: dict[str, object] = {}
         current_section = ""
         current_subsection = ""
+        current_flags_list = ""
         for raw in path.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
             if not line or line.startswith("#"):
@@ -273,18 +274,21 @@ def _read_rules_yaml(path: Path) -> dict:
             if line.startswith("flags:"):
                 current_section = "flags"
                 current_subsection = ""
+                current_flags_list = ""
                 data.setdefault("flags", {})
                 continue
             if line.startswith("env_bias:"):
                 current_section = "env_bias"
                 current_subsection = ""
+                current_flags_list = ""
                 data.setdefault("env_bias", {})
                 continue
             if line.startswith("-") and current_section == "flags":
                 item = line.lstrip("-").strip()
                 if item:
-                    data.setdefault("flags", {}).setdefault("ignore", [])
-                    data["flags"]["ignore"].append(item)
+                    target_list = current_flags_list or "ignore"
+                    data.setdefault("flags", {}).setdefault(target_list, [])
+                    data["flags"][target_list].append(item)
                 continue
             if line.endswith(":") and current_section == "env_bias":
                 current_subsection = line[:-1].strip()
@@ -295,10 +299,23 @@ def _read_rules_yaml(path: Path) -> dict:
                 key = key.strip()
                 value = value.strip()
                 if current_section == "flags" and key == "ignore":
+                    current_flags_list = "ignore"
                     if value.startswith("[") and value.endswith("]"):
                         inner = value[1:-1].strip()
                         items = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
                         data.setdefault("flags", {})["ignore"] = items
+                elif current_section == "flags" and key == "block":
+                    current_flags_list = "block"
+                    if value.startswith("[") and value.endswith("]"):
+                        inner = value[1:-1].strip()
+                        items = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+                        data.setdefault("flags", {})["block"] = items
+                elif current_section == "flags" and key == "warn":
+                    current_flags_list = "warn"
+                    if value.startswith("[") and value.endswith("]"):
+                        inner = value[1:-1].strip()
+                        items = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+                        data.setdefault("flags", {})["warn"] = items
                 elif current_section == "env_bias" and current_subsection:
                     if key == "action":
                         data.setdefault("env_bias", {}).setdefault(current_subsection, {})["action"] = value
@@ -312,16 +329,28 @@ def _normalize_rules_for_agent(raw_rules: object) -> dict:
     if isinstance(raw_rules, dict):
         rules.update(raw_rules)
     flags_ignore: List[str] = []
+    flags_block: List[str] = []
+    flags_warn: List[str] = []
     flags = rules.get("flags", {})
     if isinstance(flags, dict):
         ignore = flags.get("ignore", [])
+        block = flags.get("block", [])
+        warn = flags.get("warn", [])
         if isinstance(ignore, list):
             flags_ignore = [str(x) for x in ignore if str(x)]
         elif isinstance(ignore, str):
             flags_ignore = [ignore]
+        if isinstance(block, list):
+            flags_block = [str(x) for x in block if str(x)]
+        elif isinstance(block, str):
+            flags_block = [block]
+        if isinstance(warn, list):
+            flags_warn = [str(x) for x in warn if str(x)]
+        elif isinstance(warn, str):
+            flags_warn = [warn]
     if not flags_ignore:
         flags_ignore = ["data_quality_low", "halted", "bad_symbol"]
-    rules["flags"] = {"ignore": flags_ignore}
+    rules["flags"] = {"ignore": flags_ignore, "block": flags_block, "warn": flags_warn}
 
     env_bias = rules.get("env_bias", {})
     normalized_env = {"bull": {"action": "allow"}, "neutral": {"action": "allow"}, "bear": {"action": "allow"}}
@@ -494,6 +523,30 @@ def build_notification_message(summary: dict, max_enter: int) -> str:
     return "\n".join(lines)
 
 
+def build_deviation_warning_message(summary: dict, deviation: dict) -> str:
+    warning_level = str(deviation.get("warning_level", "")).upper()
+    counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
+    risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
+    mode = risk_mode.get("mode", "unknown")
+    strength = risk_mode.get("strength", 0)
+    asof_date = summary.get("asof_date_utc", "")
+    decision_id = summary.get("decision_digest", {}).get("decision_id", "")
+    warning_reasons = deviation.get("warning_reasons", [])
+    if not isinstance(warning_reasons, list):
+        warning_reasons = []
+
+    lines = [
+        f"[{warning_level}] deviation_7d={counts.get('deviation_7d', 0)} "
+        f"unknown_symbol_days_7d={counts.get('unknown_symbol_days_7d', 0)} "
+        f"no_trade_ignored_streak={counts.get('no_trade_ignored_streak', 0)}",
+        f"asof={asof_date} decision_id={decision_id}",
+        f"risk_mode={mode}/{strength}",
+    ]
+    if warning_reasons:
+        lines.append("reasons=" + ";".join([str(x) for x in warning_reasons]))
+    return "\n".join(lines)
+
+
 def post_discord(webhook_url: str, content: str) -> tuple[bool, Optional[int], Optional[str]]:
     payload = json.dumps({"content": content}).encode("utf-8")
     req = urllib.request.Request(
@@ -521,8 +574,12 @@ def build_agent_verdict(summary: dict, rules_used: dict, rules_source: str) -> d
     risk_mode_value = str(risk_mode.get("mode", "")).upper()
     rules_flags = rules_used.get("flags", {}) if isinstance(rules_used.get("flags", {}), dict) else {}
     ignore_flags = rules_flags.get("ignore", []) if isinstance(rules_flags.get("ignore", []), list) else []
+    block_flags = rules_flags.get("block", []) if isinstance(rules_flags.get("block", []), list) else []
+    warn_flags = rules_flags.get("warn", []) if isinstance(rules_flags.get("warn", []), list) else []
+    blocking_flags = set(ignore_flags) | set(block_flags)
 
     blocked_candidates: List[dict] = []
+    warned_candidates: List[dict] = []
     for row in enter_candidates:
         flags = row.get("flags", [])
         if isinstance(flags, list):
@@ -531,9 +588,12 @@ def build_agent_verdict(summary: dict, rules_used: dict, rules_source: str) -> d
             items = [flags]
         else:
             items = []
-        blocked = [flag for flag in items if flag in ignore_flags]
+        blocked = [flag for flag in items if flag in blocking_flags]
+        warned = [flag for flag in items if flag in warn_flags]
         if blocked and len(blocked_candidates) < 3:
             blocked_candidates.append({"symbol": row.get("symbol", ""), "flags": blocked})
+        if warned and len(warned_candidates) < 3:
+            warned_candidates.append({"symbol": row.get("symbol", ""), "flags": warned})
 
     enter_exists_ok = enter_count > 0
     no_ignored_ok = len(blocked_candidates) == 0
@@ -561,13 +621,19 @@ def build_agent_verdict(summary: dict, rules_used: dict, rules_source: str) -> d
             "detail": "no ignored flags" if no_ignored_ok else f"blocked={blocked_candidates}",
         },
         {
+            "id": "warn_flags_present",
+            "ok": len(warned_candidates) == 0,
+            "detail": "no warn flags" if len(warned_candidates) == 0 else f"warned={warned_candidates}",
+        },
+        {
             "id": "env_bias_allows",
             "ok": env_bias_ok,
             "detail": f"env={current_env} action={env_action}",
         },
     ]
 
-    failed_checks = [c["id"] for c in checks if not c["ok"]]
+    failed_checks = [c["id"] for c in checks if not c["ok"] and c["id"] != "warn_flags_present"]
+    warning_checks = [c for c in checks if c["id"] == "warn_flags_present"]
 
     if not enter_exists_ok:
         reason = "ENTER candidates = 0"
@@ -591,11 +657,13 @@ def build_agent_verdict(summary: dict, rules_used: dict, rules_source: str) -> d
         "reason": reason,
         "checks": checks,
         "failed_checks": failed_checks,
+        "warning_checks": warning_checks,
         "computed_at_utc": _now_utc_iso(),
         "source": "step10_agent_rules_v1",
         "rules_source": rules_source,
         "rules_digest": rules_digest,
         "blocked_candidates": blocked_candidates,
+        "warned_candidates": warned_candidates,
     }
 
 
@@ -982,6 +1050,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     agent = summary.get("agent", {}) if isinstance(summary.get("agent", {}), dict) else {}
     agent_checks = agent.get("checks", []) if isinstance(agent.get("checks", []), list) else []
     agent_failed_checks = agent.get("failed_checks", []) if isinstance(agent.get("failed_checks", []), list) else []
+    agent_warning_checks = agent.get("warning_checks", []) if isinstance(agent.get("warning_checks", []), list) else []
 
     message = build_notification_message(summary, max_items)
     if isinstance(message, str):
@@ -1016,137 +1085,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
             "agent_rules_digest": agent.get("rules_digest"),
+            "agent_warning_checks": agent_warning_checks,
         },
         existing_keys,
         dedup_key=f"{asof_date}:RUN_SUMMARY",
     )
 
     deviation_counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
-    deviation_types_today = sorted({d.get("type") for d in deviations_today if d.get("type")})
-    warning_reasons = deviation.get("warning_reasons", []) if isinstance(deviation.get("warning_reasons", []), list) else []
-    observed_days = deviation.get("window_detail", {}).get("observed_days", 0)
-    unknown_symbol_top = deviation.get("window_detail", {}).get("unknown_symbol_top", [])
-    if deviation.get("warning_level") == "WARN":
-        deviation_event_id = f"{asof_date}:{decision_id}:DEVIATION_WARN"
-        message_preview = (
-            f"[WARN] deviation_days_7d={deviation_counts.get('deviation_7d', 0)} "
-            f"observed_days={observed_days} "
-            f"no_trade_ignored_streak={deviation_counts.get('no_trade_ignored_streak', 0)} "
-            f"unknown_symbol_days_7d={deviation_counts.get('unknown_symbol_days_7d', 0)}"
-        )
-        send_result = "logged_only"
-        send_error = None
-        send_status = None
-        if deviation_event_id in existing_keys:
-            send_result = "skipped_duplicate"
-        elif send_enabled and webhook_url:
-            ok, status, err = post_discord(webhook_url, message_preview)
-            send_status = status
-            if ok:
-                send_result = "sent"
-            else:
-                send_result = "failed"
-                send_error = f"{err or 'send_failed'}"
-        elif send_enabled and not webhook_url:
-            send_result = "logged_only"
-            send_error = "webhook not configured (.env missing)"
-        else:
-            send_error = send_gate_reason or "send disabled"
+    warning_level = str(deviation.get("warning_level", "")).upper()
+    if warning_level in {"WARN", "CRITICAL"}:
+        kind = "DEVIATION_WARN" if warning_level == "WARN" else "DEVIATION_CRITICAL"
+        deviation_event_id = f"{asof_date}:{decision_id}:{kind}"
+        warning_reasons = deviation.get("warning_reasons", []) if isinstance(deviation.get("warning_reasons", []), list) else []
+        window_detail = deviation.get("window_detail", {}) if isinstance(deviation.get("window_detail", {}), dict) else {}
+        message_text = build_deviation_warning_message(summary, deviation)
+        message_preview = " / ".join(message_text.splitlines()[:3]) if isinstance(message_text, str) else ""
         payload = {
             "asof_date_utc": asof_date,
             **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
-            "count": len(deviations_today),
-            "deviation_today_count": len(deviations_today),
-            "deviation_7d": deviation_counts.get("deviation_7d", 0),
-            "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
-            "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
-            "observed_days": observed_days,
-            "unknown_symbol_top": unknown_symbol_top,
+            "warning_level": warning_level,
             "warning_reasons": warning_reasons,
-            "warning_level": "WARN",
-            "deviation_types": deviation_types_today,
+            "counts": {
+                "deviation_7d": deviation_counts.get("deviation_7d", 0),
+                "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
+                "no_trade_ignored_days_7d": deviation_counts.get("no_trade_ignored_days_7d", 0),
+                "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
+            },
+            "window": {
+                "window_days": deviation.get("window_days", 7),
+                "window_start_date": deviation.get("window_start_date", ""),
+                "window_end_date": deviation.get("window_end_date", ""),
+                "observed_days": window_detail.get("observed_days", 0),
+            },
             "message_preview": message_preview,
-            "result": send_result,
-            "send_result": send_result,
-            "agent_verdict": agent.get("verdict"),
-            "agent_reason": agent.get("reason"),
-            "agent_failed_checks": agent_failed_checks,
-            "agent_checks": agent_checks,
-            "agent_rules_digest": agent.get("rules_digest"),
         }
-        if send_error:
-            payload["reason"] = send_error
-        if send_status is not None:
-            payload["http_status"] = send_status
-        if send_result != "skipped_duplicate":
-            _append_alert(
-                alerts_path,
-                deviation_event_id,
-                "DEVIATION_WARN",
-                payload,
-                existing_keys,
-                dedup_key=f"{asof_date}:DEVIATION_WARN",
-            )
-    elif deviation.get("warning_level") == "CRITICAL":
-        deviation_event_id = f"{asof_date}:{decision_id}:DEVIATION_CRITICAL"
-        message_preview = (
-            f"[CRITICAL] deviation_days_7d={deviation_counts.get('deviation_7d', 0)} "
-            f"observed_days={observed_days} "
-            f"no_trade_ignored_streak={deviation_counts.get('no_trade_ignored_streak', 0)} "
-            f"unknown_symbol_days_7d={deviation_counts.get('unknown_symbol_days_7d', 0)} -> STOP/REVIEW"
-        )
-        send_result = "logged_only"
-        send_error = None
-        send_status = None
         if deviation_event_id in existing_keys:
-            send_result = "skipped_duplicate"
+            payload["send_result"] = "skipped_duplicate"
         elif send_enabled and webhook_url:
-            ok, status, err = post_discord(webhook_url, message_preview)
-            send_status = status
+            ok, status, err = post_discord(webhook_url, message_text)
             if ok:
-                send_result = "sent"
+                payload["send_result"] = "sent"
+                payload["http_status"] = status
             else:
-                send_result = "failed"
-                send_error = f"{err or 'send_failed'}"
-        elif send_enabled and not webhook_url:
-            send_result = "logged_only"
-            send_error = "webhook not configured (.env missing)"
+                payload["send_result"] = "failed"
+                payload["http_status"] = status
+                payload["reason"] = err
         else:
-            send_error = send_gate_reason or "send disabled"
-        payload = {
-            "asof_date_utc": asof_date,
-            **_build_common_payload(summary, deviation_event_id, decision_id, decision_hash, risk_mode),
-            "count": len(deviations_today),
-            "deviation_today_count": len(deviations_today),
-            "deviation_7d": deviation_counts.get("deviation_7d", 0),
-            "unknown_symbol_days_7d": deviation_counts.get("unknown_symbol_days_7d", 0),
-            "no_trade_ignored_streak": deviation_counts.get("no_trade_ignored_streak", 0),
-            "observed_days": observed_days,
-            "unknown_symbol_top": unknown_symbol_top,
-            "warning_reasons": warning_reasons,
-            "warning_level": "CRITICAL",
-            "deviation_types": deviation_types_today,
-            "message_preview": message_preview,
-            "result": send_result,
-            "send_result": send_result,
-            "agent_verdict": agent.get("verdict"),
-            "agent_reason": agent.get("reason"),
-            "agent_failed_checks": agent_failed_checks,
-            "agent_checks": agent_checks,
-            "agent_rules_digest": agent.get("rules_digest"),
-        }
-        if send_error:
-            payload["reason"] = send_error
-        if send_status is not None:
-            payload["http_status"] = send_status
-        if send_result != "skipped_duplicate":
+            payload["send_result"] = "logged_only"
+
+        if payload.get("send_result") != "skipped_duplicate":
             _append_alert(
                 alerts_path,
                 deviation_event_id,
-                "DEVIATION_CRITICAL",
+                kind,
                 payload,
                 existing_keys,
-                dedup_key=f"{asof_date}:DEVIATION_CRITICAL",
+                dedup_key=f"{asof_date}:{kind}",
             )
 
     enter_symbols_unique = sorted(set(enter_symbols))
@@ -1197,6 +1191,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
             "agent_rules_digest": agent.get("rules_digest"),
+            "agent_warning_checks": agent_warning_checks,
         }
         if send_error:
             payload["reason"] = send_error
@@ -1245,6 +1240,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
             "agent_rules_digest": agent.get("rules_digest"),
+            "agent_warning_checks": agent_warning_checks,
         }
         if send_error:
             payload["reason"] = send_error

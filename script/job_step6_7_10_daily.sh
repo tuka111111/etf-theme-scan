@@ -13,7 +13,8 @@ start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "[job_step6_7_10] start ${start_ts}"
 
 bash ./run_pipeline.sh
-"${PROJECT_ROOT}/.venv/bin/python" pipeline/step10_daily_runner.py --out out
+"${PROJECT_ROOT}/.venv/bin/python" pipeline/step10_daily_runner.py --out out --send
+
 
 end_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "[job_step6_7_10] end ${end_ts}"
