@@ -36,4 +36,10 @@ echo "[run] themes=${THEMES} out=${OUT} htf=${HTF} step2_tf=${STEP2_TF}"
 
 "${PYTHON}" -m pipeline.step5_report --themes "${THEMES}" --out "${OUT}" --contracts "${CONTRACTS}"
 
+"${PYTHON}" -m pipeline.step6_decision --out "${OUT}"
+
+"${PYTHON}" -m pipeline.step7_log --out "${OUT}"
+
+"${PYTHON}" -m pipeline.step10_daily_runner --out "${OUT}" --send
+
 echo "[done] pipeline completed"

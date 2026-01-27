@@ -277,6 +277,17 @@ def _decision_view(base_out: Path, out_root: Path) -> None:
         st.write("No actions logged today.")
 
 
+def _make_note_key(
+    asof_date: str,
+    decision_id: str,
+    symbol: str,
+    row_idx: int,
+    action_ts: str = "",
+) -> str:
+    dec = decision_id or "na"
+    return f"log_notes:{asof_date}:{dec}:{symbol}:{row_idx}:{action_ts}"
+
+
 def _decision_log_view(out_root: Path) -> None:
     st.subheader("Decision Log")
     trades_dir = out_root / "step7_trades"
@@ -457,7 +468,7 @@ def _decision_log_view(out_root: Path) -> None:
         except Exception as e:
             st.session_state["log_error"] = str(e)
 
-    for _, row in view.iterrows():
+    for row_idx, row in view.iterrows():
         row_dict = row.to_dict()
         cols = st.columns([1.2, 1.0, 0.8, 0.8, 1.6, 1.2, 1.0, 1.0])
         cols[0].write(row.get("action_ts_jst", ""))
@@ -465,19 +476,25 @@ def _decision_log_view(out_root: Path) -> None:
         cols[2].write(row.get("symbol", ""))
         cols[3].write(row.get("action", ""))
         cols[4].write(row.get("status", "active"))
-        edit_key = f"log_notes_{row.get('action_ts_jst','')}_{row.get('symbol','')}"
+        edit_key = _make_note_key(
+            row.get("asof_date_jst", ""),
+            row.get("decision_id", ""),
+            row.get("symbol", ""),
+            int(row_idx),
+            row.get("action_ts_jst", ""),
+        )
         if edit_key not in st.session_state:
             st.session_state[edit_key] = str(row.get("notes", ""))
         cols[5].text_area("notes", key=edit_key, label_visibility="collapsed", height=64)
         cols[6].button(
             "Update",
-            key=f"update_{row.get('action_ts_jst','')}_{row.get('symbol','')}",
+            key=f"update_{edit_key}",
             on_click=_append_log_action,
             args=(row_dict, "edited", st.session_state.get(edit_key, "")),
         )
         cols[7].button(
             "Obsolete",
-            key=f"obsolete_{row.get('action_ts_jst','')}_{row.get('symbol','')}",
+            key=f"obsolete_{edit_key}",
             on_click=_append_log_action,
             args=(row_dict, "obsolete", st.session_state.get(edit_key, "")),
         )
