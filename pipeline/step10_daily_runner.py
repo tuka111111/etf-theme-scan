@@ -6,6 +6,9 @@ import hashlib
 import json
 import logging
 import sys
+import os
+import sys
+import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -547,24 +550,86 @@ def build_deviation_warning_message(summary: dict, deviation: dict) -> str:
     return "\n".join(lines)
 
 
-def post_discord(webhook_url: str, content: str) -> tuple[bool, Optional[int], Optional[str]]:
-    payload = json.dumps({"content": content}).encode("utf-8")
+def _sha12(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _proxy_env_flags() -> dict:
+    keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]
+    return {k: bool(os.getenv(k)) for k in keys}
+
+
+def post_discord(
+    webhook_url: str,
+    content: str,
+    webhook_env: str,
+    debug_ping: bool = False,
+) -> tuple[bool, Optional[int], Optional[str]]:
+    payload = {"content": "webhook debug ping"} if debug_ping else {"content": content}
+    headers = {"Content-Type": "application/json", "User-Agent": "curl/8.4.0"}
+    LOG.info(
+        "webhook send: env=%s set=%s url_sha12=%s proxy_flags=%s user_agent=%s debug_ping=%s",
+        webhook_env,
+        bool(webhook_url),
+        _sha12(webhook_url) if webhook_url else "none",
+        _proxy_env_flags(),
+        headers.get("User-Agent", ""),
+        debug_ping,
+    )
+    LOG.info("webhook sys.executable: %s", sys.executable)
     req = urllib.request.Request(
         webhook_url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             status = resp.getcode()
+            LOG.info("webhook status: %s", status)
+            info_headers = {
+                "Date": resp.headers.get("Date"),
+                "Server": resp.headers.get("Server"),
+                "Via": resp.headers.get("Via"),
+                "CF-RAY": resp.headers.get("CF-RAY"),
+                "CF-Cache-Status": resp.headers.get("CF-Cache-Status"),
+                "CF-Connecting-IP": resp.headers.get("CF-Connecting-IP"),
+                "X-RateLimit-Limit": resp.headers.get("X-RateLimit-Limit"),
+                "X-RateLimit-Remaining": resp.headers.get("X-RateLimit-Remaining"),
+                "X-RateLimit-Reset": resp.headers.get("X-RateLimit-Reset"),
+            }
+            LOG.info("webhook headers: %s", info_headers)
+            body = resp.read().decode("utf-8", errors="replace")
+            if status != 204 and body:
+                LOG.error("webhook response body: %s", body[:500])
             if status in (200, 204):
                 return True, status, None
             return False, status, f"http_status={status}"
     except urllib.error.HTTPError as e:
-        return False, e.code, f"http_error={e.code}"
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        LOG.info("webhook status: %s", e.code)
+        headers = {
+            "Date": getattr(e, "headers", {}).get("Date") if getattr(e, "headers", None) else None,
+            "Server": getattr(e, "headers", {}).get("Server") if getattr(e, "headers", None) else None,
+            "Via": getattr(e, "headers", {}).get("Via") if getattr(e, "headers", None) else None,
+            "CF-RAY": getattr(e, "headers", {}).get("CF-RAY") if getattr(e, "headers", None) else None,
+            "CF-Cache-Status": getattr(e, "headers", {}).get("CF-Cache-Status") if getattr(e, "headers", None) else None,
+            "CF-Connecting-IP": getattr(e, "headers", {}).get("CF-Connecting-IP") if getattr(e, "headers", None) else None,
+            "X-RateLimit-Limit": getattr(e, "headers", {}).get("X-RateLimit-Limit") if getattr(e, "headers", None) else None,
+            "X-RateLimit-Remaining": getattr(e, "headers", {}).get("X-RateLimit-Remaining") if getattr(e, "headers", None) else None,
+            "X-RateLimit-Reset": getattr(e, "headers", {}).get("X-RateLimit-Reset") if getattr(e, "headers", None) else None,
+        }
+        LOG.info("webhook headers: %s", headers)
+        if body:
+            LOG.error("webhook response body: %s", body[:500])
+        return False, e.code, f"{e.__class__.__name__}: http_error={e.code}"
     except Exception as e:
-        return False, None, str(e)
+        LOG.error("webhook exception: %s: %s\n%s", e.__class__.__name__, e, traceback.format_exc())
+        return False, None, f"{e.__class__.__name__}: {e}"
 
 
 def build_agent_verdict(summary: dict, rules_used: dict, rules_source: str) -> dict:
@@ -672,6 +737,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--out", required=True, help="Out directory root")
     ap.add_argument("--window-days", type=int, default=7, help="Deviation window (placeholder)")
     ap.add_argument("--send", action="store_true", help="Send alerts via webhook (default: false)")
+    ap.add_argument("--debug-webhook", action="store_true", help="Send a debug ping payload (default: false)")
     ap.add_argument("--notify", action="store_true", help="Send notifications (default: false)")
     ap.add_argument("--notify-channel", default="discord", help="Notification channel (default: discord)")
     ap.add_argument("--discord-webhook", default="", help="Discord webhook URL (optional)")
@@ -688,6 +754,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_root = Path(args.out)
     alerts_config = _read_step10_alerts_config(ROOT / "config" / "step10_alerts.yaml")
     send_enabled = bool(args.send) and bool(alerts_config.get("enabled", False))
+    debug_webhook = bool(args.debug_webhook)
+    debug_ping_used = [False]
     max_items = int(alerts_config.get("max_items", 5) or 5)
     webhook_env = str(alerts_config.get("webhook_env", "STEP10_DISCORD_WEBHOOK"))
     webhook_url = get_dotenv(webhook_env)
@@ -1122,7 +1190,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if deviation_event_id in existing_keys:
             payload["send_result"] = "skipped_duplicate"
         elif send_enabled and webhook_url:
-            ok, status, err = post_discord(webhook_url, message_text)
+            debug_ping = debug_webhook and not debug_ping_used[0]
+            ok, status, err = post_discord(webhook_url, message_text, webhook_env, debug_ping)
+            if debug_ping:
+                debug_ping_used[0] = True
             if ok:
                 payload["send_result"] = "sent"
                 payload["http_status"] = status
@@ -1130,6 +1201,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 payload["send_result"] = "failed"
                 payload["http_status"] = status
                 payload["reason"] = err
+                payload["webhook_hash"] = _sha12(webhook_url) if webhook_url else ""
+                payload["proxy_flags"] = _proxy_env_flags()
+                payload["sys_executable"] = sys.executable
         else:
             payload["send_result"] = "logged_only"
 
@@ -1153,7 +1227,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if enter_event_id in existing_keys:
             send_result = "skipped_duplicate"
         elif send_enabled and webhook_url:
-            ok, status, err = post_discord(webhook_url, message)
+            debug_ping = debug_webhook and not debug_ping_used[0]
+            ok, status, err = post_discord(webhook_url, message, webhook_env, debug_ping)
+            if debug_ping:
+                debug_ping_used[0] = True
             send_status = status
             if ok:
                 send_result = "sent"
@@ -1197,6 +1274,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             payload["reason"] = send_error
         if send_status is not None:
             payload["http_status"] = send_status
+        if send_result == "failed":
+            payload["webhook_hash"] = _sha12(webhook_url) if webhook_url else ""
+            payload["proxy_flags"] = _proxy_env_flags()
+            payload["sys_executable"] = sys.executable
         if send_result != "skipped_duplicate":
             _append_alert(
                 alerts_path,
@@ -1215,7 +1296,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if no_trade_event_id in existing_keys:
             send_result = "skipped_duplicate"
         elif send_enabled and webhook_url:
-            ok, status, err = post_discord(webhook_url, message)
+            debug_ping = debug_webhook and not debug_ping_used[0]
+            ok, status, err = post_discord(webhook_url, message, webhook_env, debug_ping)
+            if debug_ping:
+                debug_ping_used[0] = True
             send_status = status
             if ok:
                 send_result = "sent"
@@ -1246,6 +1330,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             payload["reason"] = send_error
         if send_status is not None:
             payload["http_status"] = send_status
+        if send_result == "failed":
+            payload["webhook_hash"] = _sha12(webhook_url) if webhook_url else ""
+            payload["proxy_flags"] = _proxy_env_flags()
+            payload["sys_executable"] = sys.executable
         if send_result != "skipped_duplicate":
             _append_alert(
                 alerts_path,

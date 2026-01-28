@@ -1,54 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$(dirname "$0")/.."
+
+export PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+cd "${PROJECT_ROOT}"
+mkdir -p logs/launchd
+source "${PROJECT_ROOT}/env.sh"
+source "${PROJECT_ROOT}/.env"
+echo "[env] python=${PYTHON}"
+
+#echo $STEP10_DISCORD_WEBHOOK
 LOG_DIR="${PROJECT_ROOT}/logs/launchd"
 
-mkdir -p "${LOG_DIR}"
 cd "${PROJECT_ROOT}"
 
-exec >>"${LOG_DIR}/step6_7_10_daily.out.log" 2>>"${LOG_DIR}/step6_7_10_daily.err.log"
+exec >> "${LOG_DIR}/step6_7_10_daily.out.log" 2>>"${LOG_DIR}/step6_7_10_daily.err.log"
 
-PYTHON_CANDIDATES=(
-  "${PROJECT_ROOT}/.venv/bin/python3"
-  "${PROJECT_ROOT}/.venv/bin/python"
-  "/usr/bin/python3"
-  "/usr/local/bin/python3"
-  "/opt/homebrew/bin/python3"
-  "python3"
-  "python"
-)
-PYTHON=""
-for cand in "${PYTHON_CANDIDATES[@]}"; do
-  if [[ "${cand}" == "python3" || "${cand}" == "python" ]]; then
-    if command -v "${cand}" >/dev/null 2>&1; then
-      PYTHON="$(command -v "${cand}")"
-      break
-    fi
-  elif [[ -x "${cand}" ]]; then
-    PYTHON="${cand}"
-    break
-  fi
-done
+VENV_ROOT="${VENV_DIR}"
+if [[ ! -x "${VENV_ROOT}/bin/activate" ]]; then
+  echo "[job] .venv missing: ${VENV_ROOT}/bin/activate" >&2
+  exit 1
+fi
 
-if [[ -z "${PYTHON}" ]]; then
-  echo "[job] PYTHON not found. candidates:" >&2
-  for cand in "${PYTHON_CANDIDATES[@]}"; do
-    echo "  - ${cand}" >&2
-  done
+# shellcheck disable=SC1090
+source  "${VENV_ROOT}/bin/activate"
+
+if [[ ! -x "${VENV_ROOT}/bin/python" ]]; then
+  echo "[job] .venv python missing: ${VENV_ROOT}/bin/python" >&2
   exit 1
 fi
 
 echo "[job] PROJECT_ROOT=${PROJECT_ROOT}" >&2
-echo "[job] PYTHON=${PYTHON}" >&2
+echo "[job] PYTHON=$(command -v python)" >&2
+python -c 'import sys; print("[job] sys.executable=" + sys.executable)' >&2
 
 start_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "[job_step6_7_10] start ${start_ts}"
 
 
 
-bash ./run_pipeline.sh
-#"${PYTHON}" python -m pipeline.step10_daily_runner --out out --send
+bash  ./run_pipeline.sh
+#python -m pipeline.step10_daily_runner --out out --send
 
 
 end_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")

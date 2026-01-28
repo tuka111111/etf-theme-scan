@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Step1–Step5 end-to-end runner
 
-set -euo pipefail
+set -euox pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 echo "[env] python=${PYTHON}"
-
+source "${SCRIPT_DIR}/.env"
 
 THEMES="${1:-XME,SMH,XBI}"
 OUT="${OUT:-./out}"
@@ -15,6 +15,8 @@ HTF="${HTF:-1H}"
 STEP2_TF="${STEP2_TF:-1D}"
 LOOKBACK="${LOOKBACK:-260}"
 LOGLEVEL="${LOGLEVEL:-INFO}"
+
+cd "${PROJECT_ROOT}"
 
 echo "[run] themes=${THEMES} out=${OUT} htf=${HTF} step2_tf=${STEP2_TF}"
 
@@ -41,5 +43,8 @@ echo "[run] themes=${THEMES} out=${OUT} htf=${HTF} step2_tf=${STEP2_TF}"
 "${PYTHON}" -m pipeline.step7_log --out "${OUT}"
 
 "${PYTHON}" -m pipeline.step10_daily_runner --out "${OUT}" --send
+
+#"${PYTHON}" -m pipeline.step10_daily_runner --out "${OUT}" --discord-webhook $STEP10_DISCORD_WEBHOOK
+
 
 echo "[done] pipeline completed"
