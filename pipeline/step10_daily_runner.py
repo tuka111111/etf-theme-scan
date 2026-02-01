@@ -11,6 +11,7 @@ import sys
 import traceback
 import urllib.error
 import urllib.request
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -21,16 +22,21 @@ if str(ROOT) not in sys.path:
 
 from pipeline.common import ensure_dir
 from pipeline.dotenv import get_dotenv, load_dotenv
+from pipeline import rules_digest
 
 LOG = logging.getLogger(__name__)
+
+AGENT_EXT_SYSTEM_PROMPT = (
+    "You are a brief, non-advisory system. Do not make decisions or give advice. "
+    "Write 1-2 sentences in English. Provide context-only commentary."
+)
+AGENT_EXT_USER_PROMPT_TEMPLATE = "Context (JSON):\n{{context_json}}\n\nComment:"
+AGENT_EXT_PROMPT_VERSION = "v1"
+AGENT_EXT_DEFAULT_MODEL = "gpt-4o-mini"
 
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def _sha1_short(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 def _read_text(path: Path) -> str:
@@ -42,6 +48,132 @@ def _project_rel(path: Path, project_root: Path) -> str:
         return str(path.relative_to(project_root))
     except Exception:
         return path.name
+
+
+def _read_env_file(env_path: Path) -> dict:
+    if not env_path.exists():
+        return {}
+    data: dict[str, str] = {}
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                data[key] = value
+    except Exception:
+        return {}
+    return data
+
+
+def _sanitize_preview_text(text: str) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    return text.replace("/Users/", "…/")
+
+
+def _agent_ext_dedup_exists(alerts_path: Path, event_id: str, max_lines: int = 3000) -> bool:
+    if not alerts_path.exists():
+        return False
+    try:
+        with alerts_path.open(encoding="utf-8") as f:
+            lines = f.readlines()[-max_lines:]
+    except Exception:
+        return False
+    for raw in reversed(lines):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("event_id") != event_id:
+            continue
+        payload = rec.get("payload", {}) if isinstance(rec.get("payload", {}), dict) else {}
+        comment = payload.get("agent_ext_comment")
+        if isinstance(comment, str) and comment.strip():
+            return True
+    return False
+
+
+def _build_agent_ext_context(payload: dict, kind: str) -> dict:
+    decision_hash = payload.get("decision_hash", "")
+    risk_mode = payload.get("risk_mode", {}) if isinstance(payload.get("risk_mode", {}), dict) else {}
+    enter_candidates = payload.get("top", []) if isinstance(payload.get("top", []), list) else []
+    top_symbols = [str(row.get("symbol", "")).upper() for row in enter_candidates if row.get("symbol")]
+    context = {
+        "asof_date_utc": payload.get("asof_date_utc", ""),
+        "kind": kind,
+        "agent_verdict": payload.get("agent_verdict", ""),
+        "agent_reason": payload.get("agent_reason", ""),
+        "agent_failed_checks": payload.get("agent_failed_checks", []),
+        "risk_mode": {
+            "mode": risk_mode.get("mode", ""),
+            "strength": risk_mode.get("strength", ""),
+        },
+        "enter_count": payload.get("count", payload.get("enter_candidates", "")),
+        "top_symbols": top_symbols[:5],
+        "deviation_level": payload.get("level", payload.get("warning_level", "")),
+        "deviation_count_7d": payload.get("deviation_count_7d", ""),
+        "rules_hash_yaml": payload.get("rules_hash_yaml", ""),
+        "decision_hash": decision_hash,
+    }
+    msg = payload.get("message_preview", "")
+    if isinstance(msg, str) and msg:
+        context["message_preview"] = _sanitize_preview_text(msg)
+    return context
+
+
+def _call_agent_ext(
+    base_url: str,
+    api_key: str,
+    model: str,
+    context: dict,
+) -> tuple[bool, Optional[int], Optional[str], Optional[str], Optional[int]]:
+    url = base_url.rstrip("/") + "/chat/completions"
+    user_prompt = AGENT_EXT_USER_PROMPT_TEMPLATE.replace("{{context_json}}", json.dumps(context, ensure_ascii=False))
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": AGENT_EXT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": 80,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    start = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            status = resp.getcode()
+            body = resp.read().decode("utf-8", errors="replace")
+            latency_ms = int((time.time() - start) * 1000)
+            if status not in (200, 201):
+                return False, status, None, f"http_status={status}", latency_ms
+            try:
+                data = json.loads(body)
+            except Exception:
+                return False, status, None, "invalid_json", latency_ms
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            return True, status, str(content).strip(), None, latency_ms
+    except urllib.error.HTTPError as e:
+        latency_ms = int((time.time() - start) * 1000)
+        return False, e.code, None, f"{e.__class__.__name__}: http_error={e.code}", latency_ms
+    except Exception as e:
+        latency_ms = int((time.time() - start) * 1000)
+        return False, None, None, f"{e.__class__.__name__}: {e}", latency_ms
 
 
 def _safe_read_json(path: Path) -> tuple[Optional[dict], str]:
@@ -208,6 +340,57 @@ def _append_alert(
     with alerts_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
     existing.add(event_id)
+
+
+def _apply_agent_ext(
+    payload: dict,
+    kind: str,
+    event_id: str,
+    alerts_path: Path,
+    enabled: bool,
+    allowed_kinds: set[str],
+    force: bool,
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> dict:
+    payload["agent_ext_used"] = False
+    payload["agent_ext_result"] = "skipped"
+    payload["agent_ext_reason"] = "not enabled"
+    payload["agent_ext_model"] = model
+    payload["agent_ext_prompt_version"] = AGENT_EXT_PROMPT_VERSION
+
+    if not enabled:
+        return payload
+    if kind not in allowed_kinds:
+        payload["agent_ext_reason"] = "kind not allowed"
+        return payload
+    if payload.get("result") == "failed" or payload.get("send_result") == "failed":
+        payload["agent_ext_reason"] = "send failed"
+        return payload
+    if not api_key:
+        payload["agent_ext_reason"] = "missing OPENAI_API_KEY"
+        return payload
+    if not base_url:
+        payload["agent_ext_reason"] = "missing OPENAI_BASE_URL"
+        return payload
+    if not force and _agent_ext_dedup_exists(alerts_path, event_id):
+        payload["agent_ext_reason"] = "dedup"
+        return payload
+
+    context = _build_agent_ext_context(payload, kind)
+    ok, status, comment, err, latency_ms = _call_agent_ext(base_url, api_key, model, context)
+    payload["agent_ext_used"] = True
+    payload["agent_ext_latency_ms"] = latency_ms
+    payload["agent_ext_http_status"] = status
+    if ok and comment:
+        payload["agent_ext_result"] = "ok"
+        payload["agent_ext_comment"] = comment
+        payload["agent_ext_reason"] = ""
+    else:
+        payload["agent_ext_result"] = "failed"
+        payload["agent_ext_error"] = (err or "unknown")[:200]
+    return payload
 
 
 def _relative_path(path: Path) -> str:
@@ -380,11 +563,11 @@ def _read_agent_rules_yaml(path: Path) -> tuple[dict, str, Optional[str]]:
         },
     }
     if not path.exists():
-        return defaults, "missing", None
+        return defaults, "missing", rules_digest.get_rules_hash(path)
     try:
         raw_text = _read_text(path)
     except Exception:
-        return defaults, "parse_error", None
+        return defaults, "parse_error", rules_digest.get_rules_hash(path)
     rules = defaults.copy()
     section = ""
     subsection = ""
@@ -523,8 +706,7 @@ def _read_agent_rules_yaml(path: Path) -> tuple[dict, str, Optional[str]]:
                 continue
     if not rules.get("risk_mode_allow"):
         rules["risk_mode_allow"] = ["RISK_ON"]
-    rules_hash = _sha1_short(raw_text)
-    return rules, "ok", rules_hash
+    return rules, "ok", rules_digest.get_rules_hash(path)
 
 
 def _normalize_rules_for_agent(raw_rules: object) -> dict:
@@ -917,6 +1099,12 @@ def _maybe_emit_deviation_notice(
     deviation_meta: dict,
     deviation_events: List[dict],
     agent_ext_used: bool,
+    agent_ext_enabled: bool,
+    agent_ext_kinds: set[str],
+    agent_ext_force: bool,
+    agent_ext_api_key: str,
+    agent_ext_base_url: str,
+    agent_ext_model: str,
 ) -> None:
     level_7d = str(deviation_meta.get("level_7d", "")).upper()
     if level_7d not in {"WARN", "CRITICAL"}:
@@ -957,6 +1145,18 @@ def _maybe_emit_deviation_notice(
         "event_id": event_id,
         "dedup_key": dedup_key,
     }
+    payload = _apply_agent_ext(
+        payload,
+        "DEVIATION_NOTICE",
+        event_id,
+        alerts_path,
+        agent_ext_enabled,
+        agent_ext_kinds,
+        agent_ext_force,
+        agent_ext_api_key,
+        agent_ext_base_url,
+        agent_ext_model,
+    )
     if send_enabled and webhook_url:
         debug_ping = debug_webhook and not debug_ping_used[0]
         ok, status, err = post_discord(webhook_url, message_text, webhook_env, debug_ping)
@@ -1186,6 +1386,21 @@ def _evaluate_agent_verdict(
     rules_ok = rules_status == "ok"
     checks.append({"id": "rules_yaml_loaded", "ok": rules_ok, "detail": rules_detail})
 
+    rules_hash_value = str(rules_hash or "")
+    decision_hash_value = str(decision_rules_hash or "")
+    rules_sync_ok = (
+        rules_hash_value not in {"", "missing"}
+        and decision_hash_value not in {"", "missing", "missing_in_decision"}
+        and rules_hash_value == decision_hash_value
+    )
+    checks.append(
+        {
+            "id": "rules_sync_with_decision",
+            "ok": rules_sync_ok,
+            "detail": f"rules_hash_yaml={rules_hash_value} decision={decision_hash_value}",
+        }
+    )
+
     enter_ok = enter_count >= require_min
 
     if rules_status != "ok":
@@ -1220,21 +1435,6 @@ def _evaluate_agent_verdict(
             "rules_hash": rules_hash,
             "computed_at_utc": _now_utc_iso(),
         }
-
-    rules_hash_value = str(rules_hash or "")
-    decision_hash_value = str(decision_rules_hash or "")
-    rules_sync_ok = (
-        rules_hash_value not in {"", "missing"}
-        and decision_hash_value not in {"", "missing", "missing_in_decision"}
-        and rules_hash_value == decision_hash_value
-    )
-    checks.append(
-        {
-            "id": "rules_sync_with_decision",
-            "ok": rules_sync_ok,
-            "detail": f"rules_hash_yaml={rules_hash_value} decision={decision_hash_value}",
-        }
-    )
 
     checks.append({"id": "enter_exists", "ok": enter_ok, "detail": f"enter_count={enter_count} require={require_min}"})
 
@@ -1391,6 +1591,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--window-days", type=int, default=7, help="Deviation window (placeholder)")
     ap.add_argument("--send", action="store_true", help="Send alerts via webhook (default: false)")
     ap.add_argument("--debug-webhook", action="store_true", help="Send a debug ping payload (default: false)")
+    ap.add_argument("--agent-ext", action="store_true", help="Use external AI to add a short comment")
+    ap.add_argument(
+        "--agent-ext-kinds",
+        default="ENTER_ALERT,NO_TRADE_NOTICE,DEVIATION_NOTICE",
+        help="Comma-separated kinds to run external AI for",
+    )
+    ap.add_argument("--agent-ext-force", action="store_true", help="Force external AI even if deduped")
     ap.add_argument("--notify", action="store_true", help="Send notifications (default: false)")
     ap.add_argument("--notify-channel", default="discord", help="Notification channel (default: discord)")
     ap.add_argument("--discord-webhook", default="", help="Discord webhook URL (optional)")
@@ -1404,6 +1611,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     project_root = Path(__file__).resolve().parent.parent
     load_dotenv(project_root)
+    env_path = project_root / ".env"
+    env_data = _read_env_file(env_path)
     out_root = Path(args.out)
     alerts_config = _read_step10_alerts_config(ROOT / "config" / "step10_alerts.yaml")
     send_enabled = bool(args.send) and bool(alerts_config.get("enabled", False))
@@ -1412,6 +1621,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     max_items = int(alerts_config.get("max_items", 5) or 5)
     webhook_env = str(alerts_config.get("webhook_env", "STEP10_DISCORD_WEBHOOK"))
     webhook_url = get_dotenv(webhook_env)
+    agent_ext_kinds = {k.strip() for k in str(args.agent_ext_kinds).split(",") if k.strip()}
+    agent_ext_enabled = bool(args.agent_ext)
+    agent_ext_force = bool(args.agent_ext_force)
+    agent_ext_api_key = env_data.get("OPENAI_API_KEY", "")
+    agent_ext_base_url = env_data.get("OPENAI_BASE_URL", "")
+    agent_ext_model = env_data.get("OPENAI_MODEL", "") or AGENT_EXT_DEFAULT_MODEL
 
     # Debug: make send gating explicit in logs (helps diagnose "logged_only")
     send_gate_reason = ""
@@ -1542,6 +1757,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     }
     rules_path = ROOT / "config" / "rules.yaml"
     rules_agent, rules_status, rules_hash = _read_agent_rules_yaml(rules_path)
+    rules_hash_yaml = rules_digest.get_rules_hash(rules_path)
     rules_source = "config/rules.yaml" if rules_status == "ok" else None
     if rules_status == "missing":
         LOG.warning("rules.yaml missing: %s", _project_rel(rules_path, ROOT))
@@ -1585,7 +1801,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         rules_agent,
         rules_status,
         rules_source,
-        rules_hash,
+        rules_hash_yaml,
         env_bias_value,
         decision_rules_hash,
         theme_env_map,
@@ -1594,8 +1810,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     debug_step10 = summary.get("debug_step10", {}) if isinstance(summary.get("debug_step10", {}), dict) else {}
     debug_step10["rules_loaded"] = rules_status == "ok"
-    if rules_hash:
-        debug_step10["rules_hash"] = rules_hash
+    if rules_hash_yaml:
+        debug_step10["rules_hash"] = rules_hash_yaml
     summary["debug_step10"] = debug_step10
 
     if rules_max_enter > 0:
@@ -1853,6 +2069,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     event_id_run_summary = f"{asof_date}:{decision_id}:RUN_SUMMARY"
     agent = summary.get("agent", {}) if isinstance(summary.get("agent", {}), dict) else {}
     agent_checks = agent.get("checks", []) if isinstance(agent.get("checks", []), list) else []
+    rules_sync_check = next((c for c in agent_checks if c.get("id") == "rules_sync_with_decision"), None)
     agent_failed_checks = agent.get("failed_checks", []) if isinstance(agent.get("failed_checks", []), list) else []
     agent_warning_checks = agent.get("warning_checks", []) if isinstance(agent.get("warning_checks", []), list) else []
 
@@ -1876,7 +2093,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         alerts_path,
         event_id_run_summary,
         "RUN_SUMMARY",
-        {
+        _apply_agent_ext(
+            {
             "asof_date_utc": asof_date,
             **_build_common_payload(summary, event_id_run_summary, decision_id, decision_hash, risk_mode),
             "enter_candidates": len(enter_candidates),
@@ -1890,10 +2108,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_checks": agent_checks,
             "rules_source": agent.get("rules_source"),
             "rules_hash": agent.get("rules_hash"),
-            "rules_hash_yaml": agent.get("rules_hash"),
+            "rules_hash_yaml": rules_hash_yaml,
+            "rules_sync_with_decision": rules_sync_check,
             "agent_rules_digest": agent.get("rules_digest"),
             "agent_warning_checks": agent_warning_checks,
         },
+            "RUN_SUMMARY",
+            event_id_run_summary,
+            alerts_path,
+            agent_ext_enabled,
+            agent_ext_kinds,
+            agent_ext_force,
+            agent_ext_api_key,
+            agent_ext_base_url,
+            agent_ext_model,
+        ),
         existing_keys,
         dedup_key=f"{asof_date}:RUN_SUMMARY",
     )
@@ -1922,6 +2151,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         },
         deviation.get("deviation_events", []) if isinstance(deviation.get("deviation_events", []), list) else [],
         deviation.get("agent_ext_used", False),
+        agent_ext_enabled,
+        agent_ext_kinds,
+        agent_ext_force,
+        agent_ext_api_key,
+        agent_ext_base_url,
+        agent_ext_model,
     )
 
     deviation_counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
@@ -1952,6 +2187,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             },
             "message_preview": message_preview,
         }
+        payload = _apply_agent_ext(
+            payload,
+            kind,
+            deviation_event_id,
+            alerts_path,
+            agent_ext_enabled,
+            agent_ext_kinds,
+            agent_ext_force,
+            agent_ext_api_key,
+            agent_ext_base_url,
+            agent_ext_model,
+        )
         if deviation_event_id in existing_keys:
             payload["send_result"] = "skipped_duplicate"
         elif send_enabled and webhook_url:
@@ -2034,10 +2281,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_checks": agent_checks,
             "rules_source": agent.get("rules_source"),
             "rules_hash": agent.get("rules_hash"),
-            "rules_hash_yaml": agent.get("rules_hash"),
+            "rules_hash_yaml": rules_hash_yaml,
+            "rules_sync_with_decision": rules_sync_check,
             "agent_rules_digest": agent.get("rules_digest"),
             "agent_warning_checks": agent_warning_checks,
         }
+        payload = _apply_agent_ext(
+            payload,
+            "ENTER_ALERT",
+            enter_event_id,
+            alerts_path,
+            agent_ext_enabled,
+            agent_ext_kinds,
+            agent_ext_force,
+            agent_ext_api_key,
+            agent_ext_base_url,
+            agent_ext_model,
+        )
         if send_error:
             payload["reason"] = send_error
         if send_status is not None:
@@ -2098,10 +2358,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_checks": agent_checks,
             "rules_source": agent.get("rules_source"),
             "rules_hash": agent.get("rules_hash"),
-            "rules_hash_yaml": agent.get("rules_hash"),
+            "rules_hash_yaml": rules_hash_yaml,
+            "rules_sync_with_decision": rules_sync_check,
             "agent_rules_digest": agent.get("rules_digest"),
             "agent_warning_checks": agent_warning_checks,
         }
+        payload = _apply_agent_ext(
+            payload,
+            "NO_TRADE_NOTICE",
+            no_trade_event_id,
+            alerts_path,
+            agent_ext_enabled,
+            agent_ext_kinds,
+            agent_ext_force,
+            agent_ext_api_key,
+            agent_ext_base_url,
+            agent_ext_model,
+        )
         if send_error:
             payload["reason"] = send_error
         if send_status is not None:
