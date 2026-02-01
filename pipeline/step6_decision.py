@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -171,6 +172,10 @@ def _parse_rules_yaml(path: Path) -> Dict[str, object]:
             elif k == "action":
                 rules["env_bias"][sub][k] = v
     return rules
+
+
+def _sha1_short(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
 def _apply_rules(
@@ -484,7 +489,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     config_dir = Path(args.config_dir)
     scoring = _parse_scoring_yaml(config_dir / "scoring.yaml")
-    rules = _parse_rules_yaml(config_dir / "rules.yaml")
+    rules_path = config_dir / "rules.yaml"
+    rules = _parse_rules_yaml(rules_path)
+    rules_hash = "missing"
+    if rules_path.exists():
+        try:
+            rules_text = rules_path.read_text(encoding="utf-8")
+            rules_hash = _sha1_short(rules_text)
+        except Exception:
+            rules_hash = "missing"
     threshold = scoring.get(args.horizon)
 
     picks = _picks(
@@ -511,6 +524,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "asof_utc": asof_utc_norm,
         "thresholds": scoring,
         "rules": rules,
+        "rules_hash": rules_hash,
         "themes": sorted(etf_env_df["theme"].unique().tolist()),
         "risk_mode": risk,
         "etf_daily_env": [

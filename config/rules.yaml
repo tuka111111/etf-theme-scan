@@ -16,3 +16,40 @@ env_bias:
   bear:
     action: skip
     score_adjust: -10
+
+flags:
+  ignore:
+    - data_quality_low
+    - halted
+    - bad_symbol
+  weight:
+    trend_not_strong_for_signal: 0.8
+    env_bias_mismatch: 0.7
+
+env_bias:
+  bull:
+    action: allow
+    score_adjust: 0
+  neutral:
+    action: allow
+    score_adjust: -5
+  bear:
+    action: skip
+    score_adjust: -10
+
+agent:
+  flag_weight_policy:
+    enabled: true
+    min_effective_score: 80
+    use_score_adjusted_first: true
+    weights:
+      trend_not_strong_for_signal: 0.8
+      env_bias_mismatch: 0.7
+
+  env_policy:
+    enabled: true
+    require_etf_env_present: false
+    etf_env_deny:
+      - bear
+    etf_env_neutral_action: allow
+    on_deny: NO_TRADE

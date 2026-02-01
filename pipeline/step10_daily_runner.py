@@ -29,6 +29,21 @@ def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _sha1_short(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _project_rel(path: Path, project_root: Path) -> str:
+    try:
+        return str(path.relative_to(project_root))
+    except Exception:
+        return path.name
+
+
 def _safe_read_json(path: Path) -> tuple[Optional[dict], str]:
     if not path.exists():
         return None, "missing"
@@ -92,6 +107,21 @@ def _decision_enter_candidates(payload: dict) -> List[dict]:
 def _decision_hash(asof_date: str, enter_symbols: List[str]) -> str:
     data = asof_date + ":" + ",".join(sorted(set(enter_symbols)))
     return hashlib.sha1(data.encode("utf-8")).hexdigest()
+
+
+def _extract_agent_ext_verdict(payload: Optional[dict]) -> tuple[str, bool]:
+    if not payload or not isinstance(payload, dict):
+        return "", False
+    verdict = ""
+    agent_ext = payload.get("agent_ext")
+    if isinstance(agent_ext, dict):
+        verdict = agent_ext.get("verdict") or agent_ext.get("final_verdict") or ""
+    if not verdict and isinstance(payload.get("agent_ext_verdict"), str):
+        verdict = payload.get("agent_ext_verdict", "")
+    if not verdict and isinstance(payload.get("agent"), dict):
+        verdict = payload.get("agent", {}).get("ext_verdict", "") or ""
+    verdict = str(verdict).upper() if verdict else ""
+    return verdict, bool(verdict)
 
 
 def _read_trades(trades_dir: Path, asof_date_utc: str) -> List[Dict[str, str]]:
@@ -327,6 +357,176 @@ def _read_rules_yaml(path: Path) -> dict:
         return {}
 
 
+def _read_agent_rules_yaml(path: Path) -> tuple[dict, str, Optional[str]]:
+    defaults = {
+        "enabled": True,
+        "require_enter_min_count": 1,
+        "blocking_flags": [],
+        "risk_mode_allow": ["RISK_ON"],
+        "env_bias_deny": [],
+        "max_enter_to_show": 5,
+        "flag_weight_policy": {
+            "enabled": False,
+            "min_effective_score": None,
+            "use_score_adjusted_first": True,
+            "weights": {},
+        },
+        "env_policy": {
+            "enabled": False,
+            "require_etf_env_present": False,
+            "etf_env_deny": [],
+            "etf_env_neutral_action": "allow",
+            "on_deny": "NO_TRADE",
+        },
+    }
+    if not path.exists():
+        return defaults, "missing", None
+    try:
+        raw_text = _read_text(path)
+    except Exception:
+        return defaults, "parse_error", None
+    rules = defaults.copy()
+    section = ""
+    subsection = ""
+    current_list = ""
+    current_map = ""
+    for raw in raw_text.splitlines():
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        if raw.startswith((" ", "\t")) is False and raw.strip().endswith(":") and raw.strip() != "agent:":
+            section = ""
+            subsection = ""
+            current_list = ""
+        line = raw.strip()
+        if line.startswith("agent:"):
+            section = "agent"
+            subsection = ""
+            current_list = ""
+            continue
+        if section != "agent":
+            continue
+        if line.startswith("enabled:"):
+            val = line.split(":", 1)[1].strip().lower()
+            rules["enabled"] = val == "true"
+            continue
+        if line.startswith("require_enter_min_count:"):
+            try:
+                rules["require_enter_min_count"] = int(line.split(":", 1)[1].strip())
+            except Exception:
+                pass
+            continue
+        if line.startswith("max_enter_to_show:"):
+            try:
+                rules["max_enter_to_show"] = int(line.split(":", 1)[1].strip())
+            except Exception:
+                pass
+            continue
+        if line.startswith("blocking_flags:"):
+            current_list = "blocking_flags"
+            items = line.split(":", 1)[1].strip()
+            if items.startswith("[") and items.endswith("]"):
+                inner = items[1:-1].strip()
+                rules["blocking_flags"] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+                current_list = ""
+            continue
+        if line.startswith("risk_mode_policy:"):
+            subsection = "risk_mode_policy"
+            current_list = ""
+            continue
+        if line.startswith("flag_weight_policy:"):
+            subsection = "flag_weight_policy"
+            current_list = ""
+            current_map = ""
+            continue
+        if line.startswith("env_policy:"):
+            subsection = "env_policy"
+            current_list = ""
+            current_map = ""
+            continue
+        if line.startswith("env_bias_policy:"):
+            subsection = "env_bias_policy"
+            current_list = ""
+            continue
+        if subsection == "risk_mode_policy" and line.startswith("allow:"):
+            current_list = "risk_mode_allow"
+            items = line.split(":", 1)[1].strip()
+            if items.startswith("[") and items.endswith("]"):
+                inner = items[1:-1].strip()
+                rules["risk_mode_allow"] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+                current_list = ""
+            continue
+        if subsection == "env_bias_policy" and line.startswith("deny:"):
+            current_list = "env_bias_deny"
+            items = line.split(":", 1)[1].strip()
+            if items.startswith("[") and items.endswith("]"):
+                inner = items[1:-1].strip()
+                rules["env_bias_deny"] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+                current_list = ""
+            continue
+        if subsection == "flag_weight_policy" and line.startswith("enabled:"):
+            val = line.split(":", 1)[1].strip().lower()
+            rules["flag_weight_policy"]["enabled"] = val == "true"
+            continue
+        if subsection == "flag_weight_policy" and line.startswith("min_effective_score:"):
+            val = line.split(":", 1)[1].strip()
+            if val.lower() in {"null", "none", ""}:
+                rules["flag_weight_policy"]["min_effective_score"] = None
+            else:
+                try:
+                    rules["flag_weight_policy"]["min_effective_score"] = float(val)
+                except Exception:
+                    pass
+            continue
+        if subsection == "flag_weight_policy" and line.startswith("use_score_adjusted_first:"):
+            val = line.split(":", 1)[1].strip().lower()
+            rules["flag_weight_policy"]["use_score_adjusted_first"] = val == "true"
+            continue
+        if subsection == "flag_weight_policy" and line.startswith("weights:"):
+            current_map = "flag_weight_weights"
+            continue
+        if subsection == "env_policy" and line.startswith("enabled:"):
+            val = line.split(":", 1)[1].strip().lower()
+            rules["env_policy"]["enabled"] = val == "true"
+            continue
+        if subsection == "env_policy" and line.startswith("require_etf_env_present:"):
+            val = line.split(":", 1)[1].strip().lower()
+            rules["env_policy"]["require_etf_env_present"] = val == "true"
+            continue
+        if subsection == "env_policy" and line.startswith("etf_env_neutral_action:"):
+            rules["env_policy"]["etf_env_neutral_action"] = line.split(":", 1)[1].strip()
+            continue
+        if subsection == "env_policy" and line.startswith("on_deny:"):
+            rules["env_policy"]["on_deny"] = line.split(":", 1)[1].strip()
+            continue
+        if subsection == "env_policy" and line.startswith("etf_env_deny:"):
+            current_list = "env_policy_etf_env_deny"
+            items = line.split(":", 1)[1].strip()
+            if items.startswith("[") and items.endswith("]"):
+                inner = items[1:-1].strip()
+                rules["env_policy"]["etf_env_deny"] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
+                current_list = ""
+            continue
+        if line.startswith("-") and current_list:
+            item = line.lstrip("-").strip()
+            if item:
+                if current_list == "env_policy_etf_env_deny":
+                    rules["env_policy"]["etf_env_deny"].append(item)
+                else:
+                    rules[current_list].append(item)
+            continue
+        if current_map == "flag_weight_weights" and ":" in line and not line.startswith("-"):
+            key, value = line.split(":", 1)
+            key = key.strip()
+            try:
+                rules["flag_weight_policy"]["weights"][key] = float(value.strip())
+            except Exception:
+                continue
+    if not rules.get("risk_mode_allow"):
+        rules["risk_mode_allow"] = ["RISK_ON"]
+    rules_hash = _sha1_short(raw_text)
+    return rules, "ok", rules_hash
+
+
 def _normalize_rules_for_agent(raw_rules: object) -> dict:
     rules: dict[str, object] = {}
     if isinstance(raw_rules, dict):
@@ -526,6 +726,29 @@ def build_notification_message(summary: dict, max_enter: int) -> str:
     return "\n".join(lines)
 
 
+def build_no_trade_message(summary: dict, reason: str, rules_hash_yaml: Optional[str]) -> str:
+    risk_mode = summary.get("risk_mode", {}) if isinstance(summary.get("risk_mode", {}), dict) else {}
+    mode = risk_mode.get("mode", "unknown")
+    strength = risk_mode.get("strength", 0)
+    asof_date = summary.get("asof_date_utc", "")
+    generated_at = summary.get("generated_at_utc", "")
+    digest = summary.get("decision_digest", {}) if isinstance(summary.get("decision_digest", {}), dict) else {}
+    decision_id = digest.get("decision_id", "")
+    decision_hash = digest.get("decision_hash", "")
+    if decision_hash:
+        decision_hash = decision_hash[:12]
+    rules_hash_text = rules_hash_yaml if rules_hash_yaml else "N/A"
+
+    lines = [
+        f"[{mode} {strength}] NO TRADE",
+        f"reason={reason}",
+        f"asof={asof_date} generated_at_utc={generated_at}",
+        f"decision_id={decision_id} decision_hash={decision_hash}",
+        f"rules_hash_yaml={rules_hash_text}",
+    ]
+    return "\n".join(lines)
+
+
 def build_deviation_warning_message(summary: dict, deviation: dict) -> str:
     warning_level = str(deviation.get("warning_level", "")).upper()
     counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
@@ -548,6 +771,212 @@ def build_deviation_warning_message(summary: dict, deviation: dict) -> str:
     if warning_reasons:
         lines.append("reasons=" + ";".join([str(x) for x in warning_reasons]))
     return "\n".join(lines)
+
+
+def _compute_deviation_today(
+    decision_enter_symbols: List[str],
+    trade_enter_symbols: List[str],
+    agent_verdict: str,
+    agent_ext_verdict: str,
+    agent_ext_used: bool,
+) -> dict:
+    events: List[dict] = []
+    trade_count = len(trade_enter_symbols)
+    agent_verdict_upper = str(agent_verdict or "").upper()
+    agent_ext_upper = str(agent_ext_verdict or "").upper()
+
+    if trade_count > 0 and (agent_verdict_upper == "NO_TRADE" or agent_ext_upper == "NO_TRADE"):
+        score = 2
+        if agent_ext_used and agent_ext_upper == "NO_TRADE":
+            score += 2
+        events.append(
+            {
+                "id": "no_trade_enter",
+                "score": score,
+                "detail": f"agent_no_trade trade_enter_symbols_count={trade_count}",
+                "count": trade_count,
+                "symbols": trade_enter_symbols,
+            }
+        )
+
+    unknown_symbols = sorted(set(trade_enter_symbols) - set(decision_enter_symbols))
+    if unknown_symbols:
+        events.append(
+            {
+                "id": "enter_not_in_decision",
+                "score": 1,
+                "detail": f"symbols_not_in_decision={len(unknown_symbols)}",
+                "count": len(unknown_symbols),
+                "symbols": unknown_symbols,
+            }
+        )
+
+    score_total = 0
+    for row in events:
+        try:
+            score_total += int(row.get("score", 0) or 0)
+        except Exception:
+            continue
+    return {
+        "deviation_events": events,
+        "deviation_count_today": len(events),
+        "deviation_score_today": score_total,
+        "agent_ext_used": bool(agent_ext_used),
+    }
+
+
+def _compute_deviation_7d(out_dir: Path, asof_date: str, window_days: int, today_payload: dict) -> dict:
+    window_dates = _window_dates(asof_date, window_days)
+    window_asof_dates: List[str] = []
+    missing_days: List[str] = []
+    deviation_count_7d = 0
+    deviation_score_7d = 0
+
+    for day in window_dates:
+        payload = today_payload if day == asof_date else _load_deviation_for_date(out_dir, day)
+        if not payload or not isinstance(payload, dict):
+            missing_days.append(day)
+            continue
+        count = payload.get("deviation_count_today")
+        score = payload.get("deviation_score_today")
+        if not isinstance(count, int) or not isinstance(score, (int, float)):
+            events = payload.get("deviation_events", [])
+            if isinstance(events, list):
+                count = len(events)
+                score = 0
+                for row in events:
+                    try:
+                        score += int(row.get("score", 0) or 0)
+                    except Exception:
+                        continue
+            else:
+                missing_days.append(day)
+                continue
+        window_asof_dates.append(day)
+        deviation_count_7d += int(count)
+        deviation_score_7d += int(score)
+
+    level_7d = "OK"
+    level_reason = "count<2"
+    if deviation_count_7d >= 4:
+        level_7d = "CRITICAL"
+        level_reason = "count>=4"
+    elif deviation_count_7d >= 2:
+        level_7d = "WARN"
+        level_reason = "count>=2"
+    if level_7d == "WARN" and deviation_score_7d >= 6:
+        level_7d = "CRITICAL"
+        level_reason = "score>=6"
+
+    return {
+        "window_dates": window_dates,
+        "window_asof_dates": window_asof_dates,
+        "missing_days": missing_days,
+        "deviation_count_7d": deviation_count_7d,
+        "deviation_score_7d": deviation_score_7d,
+        "level_7d": level_7d,
+        "level_reason": level_reason,
+    }
+
+
+def _build_deviation_notice_message(
+    asof_date: str,
+    decision_id: str,
+    level_7d: str,
+    deviation_count_7d: int,
+    deviation_score_7d: int,
+    window_days: int,
+    missing_days: List[str],
+    top_reasons: List[str],
+) -> str:
+    lines = [
+        f"[DEVIATION_{level_7d}_7D] count={deviation_count_7d} score={deviation_score_7d} window_days={window_days}",
+        f"asof={asof_date} decision_id={decision_id}",
+    ]
+    if missing_days:
+        lines.append(f"missing_days={len(missing_days)}")
+    if top_reasons:
+        lines.append("reasons=" + ";".join([str(x) for x in top_reasons if str(x)]))
+    return "\n".join(lines)
+
+
+def _maybe_emit_deviation_notice(
+    alerts_path: Path,
+    existing_keys: set[str],
+    summary: dict,
+    asof_date: str,
+    decision_id: str,
+    decision_hash: str,
+    risk_mode: dict,
+    send_enabled: bool,
+    webhook_url: str,
+    webhook_env: str,
+    debug_webhook: bool,
+    debug_ping_used: List[bool],
+    send_gate_reason: str,
+    deviation_meta: dict,
+    deviation_events: List[dict],
+    agent_ext_used: bool,
+) -> None:
+    level_7d = str(deviation_meta.get("level_7d", "")).upper()
+    if level_7d not in {"WARN", "CRITICAL"}:
+        return
+    event_id = f"{asof_date}:hash:{decision_hash}:DEVIATION_{level_7d}_7D"
+    dedup_key = f"{asof_date}:DEVIATION_NOTICE"
+    if event_id in existing_keys:
+        return
+    top_reasons = []
+    for row in deviation_events:
+        detail = row.get("detail", "")
+        if detail:
+            top_reasons.append(str(detail))
+        if len(top_reasons) >= 3:
+            break
+    message_text = _build_deviation_notice_message(
+        asof_date,
+        decision_id,
+        level_7d,
+        int(deviation_meta.get("deviation_count_7d", 0) or 0),
+        int(deviation_meta.get("deviation_score_7d", 0) or 0),
+        int(deviation_meta.get("window_days", 7) or 7),
+        deviation_meta.get("missing_days", []) if isinstance(deviation_meta.get("missing_days", []), list) else [],
+        top_reasons,
+    )
+    payload = {
+        "asof_date_utc": asof_date,
+        **_build_common_payload(summary, event_id, decision_id, decision_hash, risk_mode),
+        "level": level_7d,
+        "deviation_count_7d": deviation_meta.get("deviation_count_7d", 0),
+        "deviation_score_7d": deviation_meta.get("deviation_score_7d", 0),
+        "window_days": deviation_meta.get("window_days", 7),
+        "window_asof_dates": deviation_meta.get("window_asof_dates", []),
+        "missing_days": deviation_meta.get("missing_days", []),
+        "top_reasons": top_reasons,
+        "agent_ext_used": bool(agent_ext_used),
+        "message_preview": message_text,
+        "event_id": event_id,
+        "dedup_key": dedup_key,
+    }
+    if send_enabled and webhook_url:
+        debug_ping = debug_webhook and not debug_ping_used[0]
+        ok, status, err = post_discord(webhook_url, message_text, webhook_env, debug_ping)
+        if debug_ping:
+            debug_ping_used[0] = True
+        if ok:
+            payload["send_result"] = "sent"
+            payload["http_status"] = status
+        else:
+            payload["send_result"] = "failed"
+            payload["http_status"] = status
+            payload["reason"] = err
+            payload["webhook_hash"] = _sha12(webhook_url) if webhook_url else ""
+            payload["proxy_flags"] = _proxy_env_flags()
+            payload["sys_executable"] = sys.executable
+    else:
+        payload["send_result"] = "logged_only"
+        if send_gate_reason:
+            payload["reason"] = send_gate_reason
+    _append_alert(alerts_path, event_id, "DEVIATION_NOTICE", payload, existing_keys, dedup_key=dedup_key)
 
 
 def _sha12(text: str) -> str:
@@ -732,6 +1161,230 @@ def build_agent_verdict(summary: dict, rules_used: dict, rules_source: str) -> d
     }
 
 
+def _evaluate_agent_verdict(
+    summary: dict,
+    enter_candidates: List[dict],
+    rules: dict,
+    rules_status: str,
+    rules_source: Optional[str],
+    rules_hash: Optional[str],
+    env_bias_value: str,
+    decision_rules_hash: str,
+    theme_env_map: Dict[str, str],
+    top_n: int,
+) -> dict:
+    enter_count = len(enter_candidates)
+    require_min = int(rules.get("require_enter_min_count", 1) or 1)
+    blocking_flags = [str(x) for x in rules.get("blocking_flags", []) if str(x)]
+    risk_mode_allow = [str(x) for x in rules.get("risk_mode_allow", []) if str(x)]
+    env_bias_deny = [str(x) for x in rules.get("env_bias_deny", []) if str(x)]
+
+    checks: List[dict] = []
+    failed_checks: List[str] = []
+
+    rules_detail = "loaded" if rules_status == "ok" else rules_status
+    rules_ok = rules_status == "ok"
+    checks.append({"id": "rules_yaml_loaded", "ok": rules_ok, "detail": rules_detail})
+
+    enter_ok = enter_count >= require_min
+
+    if rules_status != "ok":
+        verdict = "ENTER_OK" if enter_ok else "NO_TRADE"
+        reason = f"fallback: rules.yaml {rules_status}"
+        failed_checks.append("rules_yaml_loaded")
+        if not enter_ok:
+            failed_checks.append("enter_exists")
+        return {
+            "schema_version": "agent_v1",
+            "verdict": verdict,
+            "reason": reason,
+            "checks": checks,
+            "failed_checks": failed_checks,
+            "rules_source": rules_source,
+            "rules_hash": rules_hash,
+            "computed_at_utc": _now_utc_iso(),
+        }
+
+    if not bool(rules.get("enabled", True)):
+        verdict = "ENTER_OK" if enter_ok else "NO_TRADE"
+        reason = "agent disabled"
+        if not enter_ok:
+            failed_checks.append("enter_exists")
+        return {
+            "schema_version": "agent_v1",
+            "verdict": verdict,
+            "reason": reason,
+            "checks": checks,
+            "failed_checks": failed_checks,
+            "rules_source": rules_source,
+            "rules_hash": rules_hash,
+            "computed_at_utc": _now_utc_iso(),
+        }
+
+    rules_hash_value = str(rules_hash or "")
+    decision_hash_value = str(decision_rules_hash or "")
+    rules_sync_ok = (
+        rules_hash_value not in {"", "missing"}
+        and decision_hash_value not in {"", "missing", "missing_in_decision"}
+        and rules_hash_value == decision_hash_value
+    )
+    checks.append(
+        {
+            "id": "rules_sync_with_decision",
+            "ok": rules_sync_ok,
+            "detail": f"rules_hash_yaml={rules_hash_value} decision={decision_hash_value}",
+        }
+    )
+
+    checks.append({"id": "enter_exists", "ok": enter_ok, "detail": f"enter_count={enter_count} require={require_min}"})
+
+    blocked = []
+    if blocking_flags:
+        candidate_flags: set[str] = set()
+        for row in enter_candidates:
+            flags = row.get("flags", [])
+            if isinstance(flags, list):
+                candidate_flags.update([str(x) for x in flags if str(x)])
+            elif isinstance(flags, str) and flags:
+                candidate_flags.add(flags)
+        blocked = [f for f in blocking_flags if f in candidate_flags]
+    blocked_preview = blocked[:3]
+    checks.append(
+        {
+            "id": "no_blocking_flags",
+            "ok": len(blocked) == 0,
+            "detail": f"blocked={blocked_preview}" if blocked else "blocked=[]",
+        }
+    )
+
+    risk_mode = str(summary.get("risk_mode", {}).get("mode", "unknown")).upper()
+    checks.append(
+        {
+            "id": "risk_mode_allows",
+            "ok": risk_mode in risk_mode_allow,
+            "detail": f"risk_mode={risk_mode} allow={risk_mode_allow}",
+        }
+    )
+
+    env_policy = rules.get("env_policy", {}) if isinstance(rules.get("env_policy", {}), dict) else {}
+    env_policy_ok = True
+    env_policy_detail = "skipped"
+    if bool(env_policy.get("enabled", False)):
+        deny_list = [str(x).lower() for x in env_policy.get("etf_env_deny", []) if str(x)]
+        neutral_action = str(env_policy.get("etf_env_neutral_action", "allow")).lower()
+        require_present = bool(env_policy.get("require_etf_env_present", False))
+        checked = []
+        env_policy_ok = True
+        for row in enter_candidates[: max(1, top_n)]:
+            theme = str(row.get("theme", "")).strip()
+            env = str(theme_env_map.get(theme, "")).lower() if theme else ""
+            if not env and require_present:
+                env_policy_ok = False
+            if env in deny_list:
+                env_policy_ok = False
+            if env == "neutral" and neutral_action == "deny":
+                env_policy_ok = False
+            if theme:
+                checked.append(f"{theme}={env or 'missing'}")
+        env_policy_detail = "themes_checked=" + ",".join(checked[:5]) + f" deny={deny_list}"
+        checks.append({"id": "etf_env_policy", "ok": env_policy_ok, "detail": env_policy_detail})
+
+    flag_weight_policy = rules.get("flag_weight_policy", {}) if isinstance(rules.get("flag_weight_policy", {}), dict) else {}
+    flag_weight_ok = True
+    flag_weight_detail = "skipped"
+    if bool(flag_weight_policy.get("enabled", False)):
+        min_effective_score = flag_weight_policy.get("min_effective_score")
+        if min_effective_score is None:
+            flag_weight_ok = True
+            flag_weight_detail = "min not set"
+        else:
+            try:
+                min_effective_score = float(min_effective_score)
+            except Exception:
+                min_effective_score = None
+            weights = flag_weight_policy.get("weights", {}) if isinstance(flag_weight_policy.get("weights", {}), dict) else {}
+            use_score_adjusted_first = bool(flag_weight_policy.get("use_score_adjusted_first", True))
+            details = []
+            flag_weight_ok = True
+            for row in enter_candidates[: max(1, top_n)]:
+                symbol = str(row.get("symbol", "")).upper()
+                score_adjusted = row.get("score_adjusted")
+                score_total = row.get("score_total")
+                base = score_adjusted if use_score_adjusted_first and score_adjusted not in {None, ""} else score_total
+                try:
+                    base_val = float(base)
+                except Exception:
+                    base_val = 0.0
+                effective = base_val
+                if not (use_score_adjusted_first and score_adjusted not in {None, ""}):
+                    flags = row.get("flags", [])
+                    if isinstance(flags, list):
+                        for f in flags:
+                            if f in weights:
+                                try:
+                                    effective *= float(weights.get(f))
+                                except Exception:
+                                    continue
+                    elif isinstance(flags, str) and flags in weights:
+                        try:
+                            effective *= float(weights.get(flags))
+                        except Exception:
+                            pass
+                if min_effective_score is not None and effective < float(min_effective_score):
+                    flag_weight_ok = False
+                details.append(f"{symbol} base={base_val} eff={round(effective,2)}")
+            flag_weight_detail = f"min={min_effective_score} top: " + "; ".join(details[:3])
+        checks.append({"id": "flag_weight_effective_score", "ok": flag_weight_ok, "detail": flag_weight_detail})
+
+    env_bias_value = str(env_bias_value or "")
+    if env_bias_value:
+        env_bias_upper = env_bias_value.upper()
+        deny_upper = [d.upper() for d in env_bias_deny if d]
+        checks.append(
+            {
+                "id": "env_bias_allows",
+                "ok": env_bias_upper not in deny_upper,
+                "detail": f"env_bias={env_bias_upper} deny={env_bias_deny}",
+            }
+        )
+
+    for check in checks:
+        if not check.get("ok") and check.get("id") != "rules_yaml_loaded":
+            failed_checks.append(check.get("id"))
+
+    verdict = "ENTER_OK"
+    reason = "checks passed"
+    if not rules_sync_ok:
+        verdict = "NO_TRADE"
+        reason = "rules mismatch; run step6"
+    elif env_policy and bool(env_policy.get("enabled", False)) and not env_policy_ok:
+        verdict = "NO_TRADE"
+        reason = "etf env deny"
+    elif len(blocked) > 0:
+        verdict = "NO_TRADE"
+        reason = "blocking flags"
+    elif risk_mode not in risk_mode_allow:
+        verdict = "NO_TRADE"
+        reason = "risk mode deny"
+    elif flag_weight_policy and bool(flag_weight_policy.get("enabled", False)) and not flag_weight_ok:
+        verdict = "NO_TRADE"
+        reason = "effective_score below min"
+    elif not enter_ok:
+        verdict = "NO_TRADE"
+        reason = "no enter candidates"
+
+    return {
+        "schema_version": "agent_v1",
+        "verdict": verdict,
+        "reason": reason,
+        "checks": checks,
+        "failed_checks": failed_checks,
+        "rules_source": rules_source,
+        "rules_hash": rules_hash,
+        "computed_at_utc": _now_utc_iso(),
+    }
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Step10 daily runner (summary + deviation + alerts)")
     ap.add_argument("--out", required=True, help="Out directory root")
@@ -813,6 +1466,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "decision_enter_symbols": [],
         "trade_enter_symbols_today": [],
         "deviations_today": [],
+        "deviation_events": [],
+        "deviation_count_today": 0,
+        "deviation_score_today": 0,
+        "deviation_count_7d": 0,
+        "deviation_score_7d": 0,
+        "window_asof_dates": [],
+        "missing_days": [],
+        "level_7d": "UNKNOWN",
+        "level_reason": "",
+        "agent_ext_used": False,
         "counts": {
             "deviation_today": 0,
             "deviation_7d": 0,
@@ -865,6 +1528,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             summary["warnings"].append(f"decision_parse_error: {e}")
 
     decision_hash = _decision_hash(asof_date, enter_symbols)
+    if decision_status != "ok":
+        decision_hash = "missing"
     decision_id = ""
     if decision_payload and isinstance(decision_payload.get("decision_id"), str) and decision_payload.get("decision_id"):
         decision_id = str(decision_payload.get("decision_id"))
@@ -875,21 +1540,73 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "decision_id": decision_id,
         "enter_symbols": enter_symbols,
     }
-    rules_used = {}
-    rules_source = "defaults"
-    if decision_payload and isinstance(decision_payload.get("rules"), dict):
-        rules_used = _normalize_rules_for_agent(decision_payload.get("rules"))
-        rules_source = "decision.rules"
-    else:
-        rules_path = ROOT / "config" / "rules.yaml"
-        if rules_path.exists():
-            rules_used = _normalize_rules_for_agent(_read_rules_yaml(rules_path))
-            rules_source = "config.rules.yaml"
-        else:
-            rules_used = _normalize_rules_for_agent({})
-            rules_source = "defaults"
+    rules_path = ROOT / "config" / "rules.yaml"
+    rules_agent, rules_status, rules_hash = _read_agent_rules_yaml(rules_path)
+    rules_source = "config/rules.yaml" if rules_status == "ok" else None
+    if rules_status == "missing":
+        LOG.warning("rules.yaml missing: %s", _project_rel(rules_path, ROOT))
+    elif rules_status == "parse_error":
+        LOG.warning("rules.yaml parse_error: %s", _project_rel(rules_path, ROOT))
 
-    summary["agent"] = build_agent_verdict(summary, rules_used, rules_source)
+    env_bias_value = ""
+    if decision_payload and isinstance(decision_payload.get("env_bias"), str):
+        env_bias_value = str(decision_payload.get("env_bias", ""))
+    elif isinstance(summary.get("env_bias"), str):
+        env_bias_value = str(summary.get("env_bias", ""))
+
+    decision_rules_hash = "missing_in_decision"
+    if decision_payload:
+        if isinstance(decision_payload.get("rules_hash"), str) and decision_payload.get("rules_hash"):
+            decision_rules_hash = str(decision_payload.get("rules_hash"))
+        elif isinstance(decision_payload.get("debug", {}), dict):
+            debug_rules_hash = decision_payload.get("debug", {}).get("rules_hash")
+            if isinstance(debug_rules_hash, str) and debug_rules_hash:
+                decision_rules_hash = debug_rules_hash
+
+    theme_env_map: Dict[str, str] = {}
+    if decision_payload and isinstance(decision_payload.get("etf_daily_env"), list):
+        for row in decision_payload.get("etf_daily_env", []):
+            if not isinstance(row, dict):
+                continue
+            theme = str(row.get("theme", "")).strip()
+            env = str(row.get("env", "")).strip()
+            if theme:
+                theme_env_map[theme] = env
+
+    rules_max_enter = rules_agent.get("max_enter_to_show", 5)
+    try:
+        rules_max_enter = int(rules_max_enter)
+    except Exception:
+        rules_max_enter = 5
+
+    summary["agent"] = _evaluate_agent_verdict(
+        summary,
+        enter_candidates,
+        rules_agent,
+        rules_status,
+        rules_source,
+        rules_hash,
+        env_bias_value,
+        decision_rules_hash,
+        theme_env_map,
+        rules_max_enter,
+    )
+
+    debug_step10 = summary.get("debug_step10", {}) if isinstance(summary.get("debug_step10", {}), dict) else {}
+    debug_step10["rules_loaded"] = rules_status == "ok"
+    if rules_hash:
+        debug_step10["rules_hash"] = rules_hash
+    summary["debug_step10"] = debug_step10
+
+    if rules_max_enter > 0:
+        max_items = min(max_items, rules_max_enter)
+
+    if summary.get("agent", {}).get("verdict") == "NO_TRADE":
+        summary["no_trade"] = {
+            "is_no_trade": True,
+            "reason": summary.get("agent", {}).get("reason", "NO_TRADE"),
+        }
+    agent_ext_verdict, agent_ext_used = _extract_agent_ext_verdict(decision_payload)
 
     today_trades = _read_trades(trades_dir, asof_date)
     trade_enter_symbols = sorted(
@@ -899,6 +1616,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if str(row.get("action", "")).upper() == "ENTER"
         }
     )
+    if not trade_enter_symbols:
+        trade_enter_symbols = sorted(
+            {
+                str(row.get("symbol", "")).upper()
+                for row in today_trades
+                if str(row.get("action", "")).upper() == "BUY"
+            }
+        )
     deviation["trade_enter_symbols_today"] = trade_enter_symbols
 
     deviations_today: List[dict] = []
@@ -973,6 +1698,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         no_trade_ignored_today = True
     deviation["no_trade_ignored_today"] = bool(no_trade_ignored_today)
 
+    deviation_today = _compute_deviation_today(
+        enter_symbols,
+        trade_enter_symbols,
+        agent_verdict,
+        agent_ext_verdict,
+        agent_ext_used,
+    )
+    deviation["deviation_events"] = deviation_today.get("deviation_events", [])
+    deviation["deviation_count_today"] = deviation_today.get("deviation_count_today", 0)
+    deviation["deviation_score_today"] = deviation_today.get("deviation_score_today", 0)
+    deviation["agent_ext_used"] = deviation_today.get("agent_ext_used", False)
+
     window_dates = _window_dates(asof_date, args.window_days)
     deviation["window_detail"] = {
         "window_days": args.window_days,
@@ -1036,15 +1773,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         alerts_fallback_days: List[str] = []
         invalid_alert_lines = 0
-        if missing_days:
-            alerts_source = _read_deviation_days_from_alerts(out_dir / "alerts.jsonl", window_dates)
-            if alerts_source:
-                invalid_alert_lines = int(alerts_source.get("invalid_alert_lines", 0))
-                for day in list(missing_days):
-                    if day in alerts_source.get("deviation_days", set()):
-                        alerts_fallback_days.append(day)
-                        hit_days.add(day)
-                        missing_days.remove(day)
 
         observed_days = len(files_read_days) + len(alerts_fallback_days)
         deviation["window_detail"]["observed_days"] = observed_days
@@ -1101,6 +1829,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     deviation["warning_reasons"] = warning_reasons
     deviation["warning_reason"] = warning_reasons[0] if warning_reasons else ""
 
+    deviation_meta = _compute_deviation_7d(out_dir, asof_date, args.window_days, deviation)
+    deviation["deviation_count_7d"] = deviation_meta.get("deviation_count_7d", 0)
+    deviation["deviation_score_7d"] = deviation_meta.get("deviation_score_7d", 0)
+    deviation["window_asof_dates"] = deviation_meta.get("window_asof_dates", [])
+    deviation["missing_days"] = deviation_meta.get("missing_days", [])
+    deviation["level_7d"] = deviation_meta.get("level_7d", "UNKNOWN")
+    deviation["level_reason"] = deviation_meta.get("level_reason", "")
+
     watchlist_path = out_dir / f"watchlist_enter_{asof_date}.txt"
     watchlist_latest = out_dir / "watchlist_enter_latest.txt"
     watchlist_symbols = sorted({str(s).upper() for s in enter_symbols if str(s)})
@@ -1152,11 +1888,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_reason": agent.get("reason"),
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
+            "rules_source": agent.get("rules_source"),
+            "rules_hash": agent.get("rules_hash"),
+            "rules_hash_yaml": agent.get("rules_hash"),
             "agent_rules_digest": agent.get("rules_digest"),
             "agent_warning_checks": agent_warning_checks,
         },
         existing_keys,
         dedup_key=f"{asof_date}:RUN_SUMMARY",
+    )
+
+    _maybe_emit_deviation_notice(
+        alerts_path,
+        existing_keys,
+        summary,
+        asof_date,
+        decision_id,
+        decision_hash,
+        risk_mode,
+        send_enabled,
+        webhook_url,
+        webhook_env,
+        debug_webhook,
+        debug_ping_used,
+        send_gate_reason,
+        {
+            "level_7d": deviation.get("level_7d"),
+            "deviation_count_7d": deviation.get("deviation_count_7d", 0),
+            "deviation_score_7d": deviation.get("deviation_score_7d", 0),
+            "window_days": deviation.get("window_days", args.window_days),
+            "window_asof_dates": deviation.get("window_asof_dates", []),
+            "missing_days": deviation.get("missing_days", []),
+        },
+        deviation.get("deviation_events", []) if isinstance(deviation.get("deviation_events", []), list) else [],
+        deviation.get("agent_ext_used", False),
     )
 
     deviation_counts = deviation.get("counts", {}) if isinstance(deviation.get("counts", {}), dict) else {}
@@ -1220,7 +1985,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     enter_symbols_unique = sorted(set(enter_symbols))
 
     enter_event_id = f"{asof_date}:{decision_id}:{_enter_symbols_hash(enter_symbols)}:ENTER_ALERT"
-    if enter_candidates:
+    if enter_candidates and agent.get("verdict") == "ENTER_OK":
         send_result = "logged_only"
         send_error = None
         send_status = None
@@ -1267,6 +2032,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "agent_reason": agent.get("reason"),
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
+            "rules_source": agent.get("rules_source"),
+            "rules_hash": agent.get("rules_hash"),
+            "rules_hash_yaml": agent.get("rules_hash"),
             "agent_rules_digest": agent.get("rules_digest"),
             "agent_warning_checks": agent_warning_checks,
         }
@@ -1293,11 +2061,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         send_result = "logged_only"
         send_error = None
         send_status = None
+        no_trade_message = build_no_trade_message(
+            summary,
+            summary["no_trade"].get("reason", ""),
+            agent.get("rules_hash"),
+        )
         if no_trade_event_id in existing_keys:
             send_result = "skipped_duplicate"
         elif send_enabled and webhook_url:
             debug_ping = debug_webhook and not debug_ping_used[0]
-            ok, status, err = post_discord(webhook_url, message, webhook_env, debug_ping)
+            ok, status, err = post_discord(webhook_url, no_trade_message, webhook_env, debug_ping)
             if debug_ping:
                 debug_ping_used[0] = True
             send_status = status
@@ -1316,13 +2089,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "asof_date_utc": asof_date,
             **_build_common_payload(summary, no_trade_event_id, decision_id, decision_hash, risk_mode),
             "reason": summary["no_trade"].get("reason", ""),
-            "message_preview": message,
+            "message_preview": no_trade_message,
             "result": send_result,
             "send_result": send_result,
             "agent_verdict": agent.get("verdict"),
             "agent_reason": agent.get("reason"),
             "agent_failed_checks": agent_failed_checks,
             "agent_checks": agent_checks,
+            "rules_source": agent.get("rules_source"),
+            "rules_hash": agent.get("rules_hash"),
+            "rules_hash_yaml": agent.get("rules_hash"),
             "agent_rules_digest": agent.get("rules_digest"),
             "agent_warning_checks": agent_warning_checks,
         }

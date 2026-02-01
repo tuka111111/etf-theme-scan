@@ -98,6 +98,25 @@ def _safe_rel_display(path_str: object) -> str:
     return path_str
 
 
+def _safe_path(value: Optional[str]) -> str:
+    if value is None:
+        return "N/A"
+    if not isinstance(value, str) or not value:
+        return "N/A"
+    if value.startswith("/"):
+        return "(redacted)"
+    return value
+
+
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
 def _safe_tail_jsonl(path: Path, n: int) -> Tuple[list[dict], int]:
     if not path.exists():
         return [], 0
@@ -113,6 +132,56 @@ def _safe_tail_jsonl(path: Path, n: int) -> Tuple[list[dict], int]:
             except Exception:
                 invalid += 1
     return list(items), invalid
+
+
+def _load_latest_alerts_for_asof(alerts_path: Path, asof: str) -> Dict[str, dict]:
+    if not alerts_path.exists():
+        return {}
+    lines: deque = deque(maxlen=200)
+    with alerts_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                lines.append(line)
+    latest: Dict[str, dict] = {}
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if rec.get("asof_date_utc") != asof:
+            continue
+        kind = rec.get("kind", "")
+        if kind not in {"ENTER_ALERT", "NO_TRADE_NOTICE", "DEVIATION_NOTICE"}:
+            continue
+        if kind in latest:
+            continue
+        latest[kind] = rec
+        if len(latest) >= 3:
+            break
+    return latest
+
+
+def _preview_text(rec: Optional[dict]) -> str:
+    if not rec:
+        return "(no preview)"
+    payload = rec.get("payload", {}) if isinstance(rec.get("payload", {}), dict) else {}
+    text = payload.get("message_preview") or payload.get("message") or "(no preview)"
+    if not isinstance(text, str):
+        text = str(text)
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        cleaned.append("(redacted)" if line.startswith("/") else line)
+    return "\n".join(cleaned)
+
+
+def _shorten(text: str, n: int = 600) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= n:
+        return text
+    return text[:n] + "\n...(truncated)"
 
 
 def main() -> None:
@@ -188,6 +257,53 @@ def main() -> None:
         f"**decision_hash**: {decision_hash}  \n**decision_path**: {decision_path}  "
         f"\n**deviation**: {warning_level} ({warning_reason_text})"
     )
+
+    st.subheader("Status")
+    decision_latest_path = out_root / "step6_decision" / "decision_latest.json"
+    decision_latest = _read_json(decision_latest_path) or {}
+    decision_generated = decision_latest.get("generated_at_utc", "N/A")
+    decision_asof = decision_latest.get("asof_date_utc", "N/A")
+    decision_path_display = _safe_path(summary.get("decision_path"))
+    st.write(
+        f"Step10: generated_at_utc={generated_at} / asof_date_utc={asof_date} / decision_path={decision_path_display}"
+    )
+    st.write(f"Step6: generated_at_utc={decision_generated} / asof_date_utc={decision_asof}")
+    agent_checks = agent.get("checks", []) if isinstance(agent.get("checks", []), list) else []
+    rules_sync = next((c for c in agent_checks if c.get("id") == "rules_sync_with_decision"), None)
+    if rules_sync:
+        detail = _shorten(str(rules_sync.get("detail", "")))
+        st.write(f"rules_sync_with_decision: ok={rules_sync.get('ok')} detail={detail}")
+        if rules_sync.get("ok") is False:
+            st.error("rules mismatch; run step6")
+    else:
+        st.write("rules_sync_with_decision: N/A")
+    deviation_level = deviation.get("level_7d") or deviation.get("warning_level", "N/A")
+    deviation_count = deviation.get("deviation_count_7d", deviation.get("counts", {}).get("deviation_7d", 0))
+    st.write(f"deviation: level_7d={deviation_level} deviation_count_7d={deviation_count}")
+
+    st.subheader(f"Latest alerts (asof={asof_date})")
+    alerts_path = daily_dir / "alerts.jsonl"
+    latest_alerts = _load_latest_alerts_for_asof(alerts_path, asof_date)
+    for kind in ["ENTER_ALERT", "NO_TRADE_NOTICE", "DEVIATION_NOTICE"]:
+        rec = latest_alerts.get(kind)
+        if not rec:
+            st.info(f"{kind}: N/A")
+            continue
+        payload = rec.get("payload", {}) if isinstance(rec.get("payload", {}), dict) else {}
+        send_result = payload.get("send_result") or payload.get("result") or "N/A"
+        http_status = payload.get("http_status")
+        ts_utc = rec.get("ts_utc", "N/A")
+        meta = f"ts_utc={ts_utc} send_result={send_result}"
+        if http_status:
+            meta += f" http_status={http_status}"
+        if kind == "DEVIATION_NOTICE":
+            level = payload.get("level", "N/A")
+            count_7d = payload.get("deviation_count_7d", "N/A")
+            meta += f" level={level} deviation_count_7d={count_7d}"
+        st.markdown(f"### {kind}")
+        st.write(meta)
+        preview = _shorten(_preview_text(rec))
+        st.code(preview)
 
     st.markdown("### Today")
     st.write(f"asof_date_utc: {asof_date} / generated_at_utc: {generated_at}")

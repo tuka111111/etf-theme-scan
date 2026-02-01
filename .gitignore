@@ -16,3 +16,4 @@ pipeline/__pycache__/
 ranking_SMH.csv
 run_pipeline.log
 
+.github/
