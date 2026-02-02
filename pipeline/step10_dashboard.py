@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import textwrap
 import sys
 from collections import deque
 from pathlib import Path
@@ -184,6 +185,27 @@ def _shorten(text: str, n: int = 600) -> str:
     return text[:n] + "\n...(truncated)"
 
 
+def _find_latest_agent_ext_comment(
+    alert_rows: list[dict],
+    asof_date_utc: str,
+    base_event_id: Optional[str],
+) -> Optional[dict]:
+    candidates = []
+    for rec in alert_rows:
+        if rec.get("kind") != "AGENT_EXT_COMMENT":
+            continue
+        payload = rec.get("payload", {}) if isinstance(rec.get("payload", {}), dict) else {}
+        if payload.get("asof_date_utc") != asof_date_utc:
+            continue
+        if base_event_id and payload.get("base_event_id") != base_event_id:
+            continue
+        candidates.append(rec)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: str(r.get("ts_utc", "")), reverse=True)
+    return candidates[0]
+
+
 def main() -> None:
     st.set_page_config(layout="wide", page_title="Step10 Daily", initial_sidebar_state="collapsed")
 
@@ -258,32 +280,46 @@ def main() -> None:
         f"\n**deviation**: {warning_level} ({warning_reason_text})"
     )
 
-    st.subheader("Status")
-    decision_latest_path = out_root / "step6_decision" / "decision_latest.json"
-    decision_latest = _read_json(decision_latest_path) or {}
-    decision_generated = decision_latest.get("generated_at_utc", "N/A")
-    decision_asof = decision_latest.get("asof_date_utc", "N/A")
-    decision_path_display = _safe_path(summary.get("decision_path"))
-    st.write(
-        f"Step10: generated_at_utc={generated_at} / asof_date_utc={asof_date} / decision_path={decision_path_display}"
-    )
-    st.write(f"Step6: generated_at_utc={decision_generated} / asof_date_utc={decision_asof}")
-    agent_checks = agent.get("checks", []) if isinstance(agent.get("checks", []), list) else []
-    rules_sync = next((c for c in agent_checks if c.get("id") == "rules_sync_with_decision"), None)
-    if rules_sync:
-        detail = _shorten(str(rules_sync.get("detail", "")))
-        st.write(f"rules_sync_with_decision: ok={rules_sync.get('ok')} detail={detail}")
-        if rules_sync.get("ok") is False:
-            st.error("rules mismatch; run step6")
-    else:
-        st.write("rules_sync_with_decision: N/A")
-    deviation_level = deviation.get("level_7d") or deviation.get("warning_level", "N/A")
-    deviation_count = deviation.get("deviation_count_7d", deviation.get("counts", {}).get("deviation_7d", 0))
-    st.write(f"deviation: level_7d={deviation_level} deviation_count_7d={deviation_count}")
+    with st.expander("Status", expanded=False):
+        decision_latest_path = out_root / "step6_decision" / "decision_latest.json"
+        decision_latest = _read_json(decision_latest_path) or {}
+        decision_generated = decision_latest.get("generated_at_utc", "N/A")
+        decision_asof = decision_latest.get("asof_date_utc", "N/A")
+        decision_path_display = _safe_path(summary.get("decision_path"))
+        st.write(
+            f"Step10: generated_at_utc={generated_at} / asof_date_utc={asof_date} / decision_path={decision_path_display}"
+        )
+        st.write(f"Step6: generated_at_utc={decision_generated} / asof_date_utc={decision_asof}")
+        agent_checks = agent.get("checks", []) if isinstance(agent.get("checks", []), list) else []
+        rules_sync = next((c for c in agent_checks if c.get("id") == "rules_sync_with_decision"), None)
+        if rules_sync:
+            detail = _shorten(str(rules_sync.get("detail", "")))
+            st.write(f"rules_sync_with_decision: ok={rules_sync.get('ok')} detail={detail}")
+            if rules_sync.get("ok") is False:
+                st.error("rules mismatch; run step6")
+        else:
+            st.write("rules_sync_with_decision: N/A")
+        deviation_level = deviation.get("level_7d") or deviation.get("warning_level", "N/A")
+        deviation_count = deviation.get("deviation_count_7d", deviation.get("counts", {}).get("deviation_7d", 0))
+        st.write(f"deviation: level_7d={deviation_level} deviation_count_7d={deviation_count}")
 
     st.subheader(f"Latest alerts (asof={asof_date})")
     alerts_path = daily_dir / "alerts.jsonl"
     latest_alerts = _load_latest_alerts_for_asof(alerts_path, asof_date)
+    enter_event_id = None
+    enter_alert_latest = latest_alerts.get("ENTER_ALERT")
+    if enter_alert_latest:
+        enter_payload = (
+            enter_alert_latest.get("payload", {})
+            if isinstance(enter_alert_latest.get("payload", {}), dict)
+            else {}
+        )
+        enter_event_id = (
+            enter_alert_latest.get("event_id")
+            or enter_payload.get("event_id")
+            or enter_alert_latest.get("dedup_key")
+            or enter_payload.get("dedup_key")
+        )
     for kind in ["ENTER_ALERT", "NO_TRADE_NOTICE", "DEVIATION_NOTICE"]:
         rec = latest_alerts.get(kind)
         if not rec:
@@ -312,6 +348,30 @@ def main() -> None:
     st.write(f"decision_id: {decision_id}")
     st.markdown(f"**agent verdict**: {agent_verdict}")
     st.write(f"agent reason: {agent_reason}")
+    alert_rows_today, _ = _safe_tail_jsonl(alerts_path, args.alerts_tail)
+    comment_rec = _find_latest_agent_ext_comment(alert_rows_today, asof_date, enter_event_id)
+    fallback_used = False
+    if comment_rec is None:
+        comment_rec = _find_latest_agent_ext_comment(alert_rows_today, asof_date, None)
+        fallback_used = comment_rec is not None
+    if comment_rec:
+        payload = comment_rec.get("payload", {}) if isinstance(comment_rec.get("payload", {}), dict) else {}
+        comment_raw = payload.get("agent_ext_comment") or "(none)"
+        comment = str(comment_raw).replace(". ", ".\n").replace(".\n\n", ".\n")
+        comment = textwrap.fill(comment, width=80, replace_whitespace=False)
+        st.markdown("**AI comment:**")
+        st.code(str(comment))
+        meta = [
+            f"model={payload.get('agent_ext_model', 'N/A')}",
+            f"latency_ms={payload.get('agent_ext_latency_ms', 'N/A')}",
+            f"http_status={payload.get('agent_ext_http_status', 'N/A')}",
+            f"force={payload.get('agent_ext_force', False)}",
+        ]
+        if fallback_used and enter_event_id:
+            meta.append("base_event_id mismatch")
+        st.caption(" / ".join(meta))
+    else:
+        st.caption("AI comment: (none)")
     if failed_checks:
         st.write("failed_checks:")
         for c in failed_checks:

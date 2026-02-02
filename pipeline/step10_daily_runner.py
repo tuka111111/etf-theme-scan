@@ -27,11 +27,20 @@ from pipeline import rules_digest
 LOG = logging.getLogger(__name__)
 
 AGENT_EXT_SYSTEM_PROMPT = (
-    "You are a brief, non-advisory system. Do not make decisions or give advice. "
-    "Write 1-2 sentences in English. Provide context-only commentary."
+    "You are a concise assistant. Output must be Japanese, 2-4 short lines. "
+    "Do not mention dates, JSON, or add preambles. Follow the exact template."
 )
-AGENT_EXT_USER_PROMPT_TEMPLATE = "Context (JSON):\n{{context_json}}\n\nComment:"
-AGENT_EXT_PROMPT_VERSION = "v1"
+AGENT_EXT_USER_PROMPT_TEMPLATE = (
+    "以下のコンテキストから、必ず4行以内で短く書いてください。"
+    "テンプレ厳守:\n"
+    "結論: {ENTER/NO_TRADE/WATCH}（理由は10〜20字）\n"
+    "対象: {symbol(theme) score adj thr を2つまで}\n"
+    "注意: {flags / deviation / rules_sync / missing など重要なものだけ}\n"
+    "次: {確認すべき1アクション。不要なら「次: -」}\n"
+    "禁止: 日付説明, JSON言及, 冗長な前置き, 英語\n"
+    "コンテキスト:\n{{context_json}}\n"
+)
+AGENT_EXT_PROMPT_VERSION = "v2"
 AGENT_EXT_DEFAULT_MODEL = "gpt-4o-mini"
 
 
@@ -75,14 +84,14 @@ def _sanitize_preview_text(text: str) -> str:
     return text.replace("/Users/", "…/")
 
 
-def _agent_ext_dedup_exists(alerts_path: Path, event_id: str, max_lines: int = 3000) -> bool:
+def _agent_ext_find_existing(alerts_path: Path, event_id: str, kind: str, max_lines: int = 3000) -> Optional[str]:
     if not alerts_path.exists():
-        return False
+        return None
     try:
         with alerts_path.open(encoding="utf-8") as f:
             lines = f.readlines()[-max_lines:]
     except Exception:
-        return False
+        return None
     for raw in reversed(lines):
         line = raw.strip()
         if not line:
@@ -93,11 +102,13 @@ def _agent_ext_dedup_exists(alerts_path: Path, event_id: str, max_lines: int = 3
             continue
         if rec.get("event_id") != event_id:
             continue
+        if rec.get("kind") != kind:
+            continue
         payload = rec.get("payload", {}) if isinstance(rec.get("payload", {}), dict) else {}
         comment = payload.get("agent_ext_comment")
         if isinstance(comment, str) and comment.strip():
-            return True
-    return False
+            return comment.strip()
+    return None
 
 
 def _build_agent_ext_context(payload: dict, kind: str) -> dict:
@@ -142,12 +153,14 @@ def _call_agent_ext(
             {"role": "system", "content": AGENT_EXT_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.2,
-        "max_tokens": 80,
+        "temperature": 0.3,
+        "max_tokens": 120,
     }
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": "stock-step10-agent_ext",
+        "X-Title": "stock-step10-agent_ext",
     }
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
     start = time.time()
@@ -174,6 +187,54 @@ def _call_agent_ext(
     except Exception as e:
         latency_ms = int((time.time() - start) * 1000)
         return False, None, None, f"{e.__class__.__name__}: {e}", latency_ms
+
+
+def _make_regen_id(context: dict) -> str:
+    regen_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    context_json = json.dumps(context, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    context_sha12 = hashlib.sha256(context_json.encode("utf-8")).hexdigest()[:12]
+    return f"{regen_ts}_{context_sha12}"
+
+
+def _emit_agent_ext_comment_record(
+    alerts_path: Path,
+    existing: set[str],
+    base_event_id: str,
+    base_kind: str,
+    asof_date: str,
+    model: str,
+    force: bool,
+    context: dict,
+    agent_ext_payload: dict,
+) -> None:
+    if force:
+        regen_id = _make_regen_id(context)
+        event_id = f"{base_event_id}:AGENT_EXT_COMMENT:regen:{regen_id}"
+        dedup_key = f"{base_event_id}:AGENT_EXT_COMMENT:regen:{regen_id}"
+    else:
+        event_id = f"{base_event_id}:AGENT_EXT_COMMENT"
+        dedup_key = f"{base_event_id}:AGENT_EXT_COMMENT"
+
+    payload = {
+        "asof_date_utc": asof_date,
+        "base_event_id": base_event_id,
+        "base_kind": base_kind,
+        "agent_ext_force": bool(force),
+        "agent_ext_model": model,
+        "agent_ext_prompt_version": AGENT_EXT_PROMPT_VERSION,
+        "agent_ext_used": True,
+        "agent_ext_result": agent_ext_payload.get("agent_ext_result"),
+        "agent_ext_http_status": agent_ext_payload.get("agent_ext_http_status"),
+        "agent_ext_latency_ms": agent_ext_payload.get("agent_ext_latency_ms"),
+        "send_result": "logged_only",
+    }
+    if agent_ext_payload.get("agent_ext_result") == "ok":
+        payload["agent_ext_comment"] = agent_ext_payload.get("agent_ext_comment", "")
+    if agent_ext_payload.get("agent_ext_result") == "failed":
+        err = agent_ext_payload.get("agent_ext_error") or "unknown"
+        payload["agent_ext_error"] = str(err)[:200]
+
+    _append_alert(alerts_path, event_id, "AGENT_EXT_COMMENT", payload, existing, dedup_key=dedup_key)
 
 
 def _safe_read_json(path: Path) -> tuple[Optional[dict], str]:
@@ -374,9 +435,14 @@ def _apply_agent_ext(
     if not base_url:
         payload["agent_ext_reason"] = "missing OPENAI_BASE_URL"
         return payload
-    if not force and _agent_ext_dedup_exists(alerts_path, event_id):
-        payload["agent_ext_reason"] = "dedup"
-        return payload
+    if not force:
+        existing = _agent_ext_find_existing(alerts_path, event_id, kind)
+        if existing:
+            payload["agent_ext_used"] = True
+            payload["agent_ext_result"] = "ok"
+            payload["agent_ext_reason"] = "reused"
+            payload["agent_ext_comment"] = existing
+            return payload
 
     context = _build_agent_ext_context(payload, kind)
     ok, status, comment, err, latency_ms = _call_agent_ext(base_url, api_key, model, context)
@@ -1176,7 +1242,27 @@ def _maybe_emit_deviation_notice(
         payload["send_result"] = "logged_only"
         if send_gate_reason:
             payload["reason"] = send_gate_reason
+    base_exists = event_id in existing_keys
     _append_alert(alerts_path, event_id, "DEVIATION_NOTICE", payload, existing_keys, dedup_key=dedup_key)
+    if (
+        (not base_exists or agent_ext_force)
+        and agent_ext_enabled
+        and "DEVIATION_NOTICE" in agent_ext_kinds
+        and payload.get("agent_ext_used") is True
+        and payload.get("agent_ext_result") in {"ok", "failed"}
+    ):
+        context = _build_agent_ext_context(payload, "DEVIATION_NOTICE")
+        _emit_agent_ext_comment_record(
+            alerts_path,
+            existing_keys,
+            event_id,
+            "DEVIATION_NOTICE",
+            asof_date,
+            agent_ext_model,
+            agent_ext_force,
+            context,
+            payload,
+        )
 
 
 def _sha12(text: str) -> str:
@@ -1627,6 +1713,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     agent_ext_api_key = env_data.get("OPENAI_API_KEY", "")
     agent_ext_base_url = env_data.get("OPENAI_BASE_URL", "")
     agent_ext_model = env_data.get("OPENAI_MODEL", "") or AGENT_EXT_DEFAULT_MODEL
+    LOG.info(
+        "agent_ext env: api_key_set=%s base_url_set=%s model_set=%s",
+        bool(agent_ext_api_key),
+        bool(agent_ext_base_url),
+        bool(agent_ext_model),
+    )
 
     # Debug: make send gating explicit in logs (helps diagnose "logged_only")
     send_gate_reason = ""
@@ -2228,6 +2320,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 existing_keys,
                 dedup_key=f"{asof_date}:{kind}",
             )
+            if (
+                agent_ext_enabled
+                and kind in agent_ext_kinds
+                and payload.get("agent_ext_used") is True
+                and payload.get("agent_ext_result") in {"ok", "failed"}
+            ):
+                context = _build_agent_ext_context(payload, kind)
+                _emit_agent_ext_comment_record(
+                    alerts_path,
+                    existing_keys,
+                    deviation_event_id,
+                    kind,
+                    asof_date,
+                    agent_ext_model,
+                    agent_ext_force,
+                    context,
+                    payload,
+                )
 
     enter_symbols_unique = sorted(set(enter_symbols))
 
@@ -2315,6 +2425,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 existing_keys,
                 dedup_key=f"{asof_date}:ENTER_ALERT",
             )
+        if send_result != "skipped_duplicate" or agent_ext_force:
+            if (
+                agent_ext_enabled
+                and "ENTER_ALERT" in agent_ext_kinds
+                and payload.get("agent_ext_used") is True
+                and payload.get("agent_ext_result") in {"ok", "failed"}
+            ):
+                context = _build_agent_ext_context(payload, "ENTER_ALERT")
+                _emit_agent_ext_comment_record(
+                    alerts_path,
+                    existing_keys,
+                    enter_event_id,
+                    "ENTER_ALERT",
+                    asof_date,
+                    agent_ext_model,
+                    agent_ext_force,
+                    context,
+                    payload,
+                )
 
     if summary.get("no_trade", {}).get("is_no_trade"):
         no_trade_event_id = f"{asof_date}:{decision_id}:{decision_hash}:NO_TRADE_NOTICE"
@@ -2392,6 +2521,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 existing_keys,
                 dedup_key=f"{asof_date}:NO_TRADE_NOTICE",
             )
+        if send_result != "skipped_duplicate" or agent_ext_force:
+            if (
+                agent_ext_enabled
+                and "NO_TRADE_NOTICE" in agent_ext_kinds
+                and payload.get("agent_ext_used") is True
+                and payload.get("agent_ext_result") in {"ok", "failed"}
+            ):
+                context = _build_agent_ext_context(payload, "NO_TRADE_NOTICE")
+                _emit_agent_ext_comment_record(
+                    alerts_path,
+                    existing_keys,
+                    no_trade_event_id,
+                    "NO_TRADE_NOTICE",
+                    asof_date,
+                    agent_ext_model,
+                    agent_ext_force,
+                    context,
+                    payload,
+                )
 
     LOG.info("wrote summary=%s deviation=%s", summary_path, deviation_path)
     return 0

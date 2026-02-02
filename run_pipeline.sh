@@ -42,7 +42,7 @@ echo "[run] themes=${THEMES} out=${OUT} htf=${HTF} step2_tf=${STEP2_TF}"
 
 "${PYTHON}" -m pipeline.step7_log --out "${OUT}"
 
-"${PYTHON}" -m pipeline.step10_daily_runner --out "${OUT}" --send
+"${PYTHON}" -m pipeline.step10_daily_runner --out "${OUT}" --send --agent-ext
 
 #"${PYTHON}" -m pipeline.step10_daily_runner --out "${OUT}" --discord-webhook $STEP10_DISCORD_WEBHOOK
 
