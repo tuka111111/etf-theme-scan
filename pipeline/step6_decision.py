@@ -11,6 +11,7 @@ import pandas as pd
 
 from .common import ensure_dir
 from .io_step6 import load_dashboard, normalize_flags
+from . import rules_digest
 
 LOG = logging.getLogger(__name__)
 
@@ -484,7 +485,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     config_dir = Path(args.config_dir)
     scoring = _parse_scoring_yaml(config_dir / "scoring.yaml")
-    rules = _parse_rules_yaml(config_dir / "rules.yaml")
+    rules_path = config_dir / "rules.yaml"
+    rules = _parse_rules_yaml(rules_path)
+    rules_source = rules_digest.get_rules_source()
+    rules_hash = rules_digest.get_rules_hash(rules_path)
     threshold = scoring.get(args.horizon)
 
     picks = _picks(
@@ -511,6 +515,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "asof_utc": asof_utc_norm,
         "thresholds": scoring,
         "rules": rules,
+        "rules_source": rules_source,
+        "rules_hash": rules_hash,
         "themes": sorted(etf_env_df["theme"].unique().tolist()),
         "risk_mode": risk,
         "etf_daily_env": [
@@ -526,7 +532,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "picks": picks,
         "warnings": warnings,
         "debug": {
-            "input_path": str(dash_path),
+            "input_path": str(dash_path.relative_to(Path.cwd())) if dash_path.is_relative_to(Path.cwd()) else "out/step5_dashboard/dashboard.csv",
             "score_col": args.score_col,
             "min_score": args.min_score,
             "top_n": args.top_n,

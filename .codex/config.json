@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "git": {
+      "command": "node",
+      "args": ["script/mcp/mcp-git-readonly.js"]
+    },
+    "log": {
+      "command": "node",
+      "args": ["script/mcp/mcp-log-analyzer.js"]
+    }
+  }
+}
+

@@ -15,4 +15,7 @@ launchd.out.log
 pipeline/__pycache__/
 ranking_SMH.csv
 run_pipeline.log
+doc/Step6_7_10_Launchd.md
+doc/Step10_LaunchAgent.md
 
+#.github/
